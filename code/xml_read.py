@@ -2292,13 +2292,10 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
             # Step length values:
             # 14 = 1/32, 12 = 1/32T, 10 = 1/16, 11 = 1/16T, 8 = 1/8, 9 = 1/8T, 6 = 1/4, 4 = 1/2, 3 = 1 Bar, 2 = 2 Bars, 1 = 4 Bars, 0 = 8 Bars
             # 1 bar = 4 beats
-            # Empty placeholder sublayers (clip exists, no notes): use 1 bar at 1/16 like main branch
-            if midi_clip and len(sublayer_events) == 0:
+            # Only use default when there is NO clip at all; otherwise extract length from clip (even if empty)
+            if not midi_clip and len(sublayer_events) == 0:
                 step_len = 10
-                step_count = 16
-            elif not midi_clip and len(sublayer_events) == 0:
-                step_len = 10
-                step_count = 1  # Truly empty slot
+                step_count = 1  # Truly empty slot, no clip
             else:
                 # For quantised sequences, use detected step_len (e.g., 14 for 1/32 notes)
                 # For unquantised, use default 1/16 (step_len=10)
