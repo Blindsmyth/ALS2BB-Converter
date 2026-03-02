@@ -2008,8 +2008,8 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
             # Keep copy of session clips for session-vs-arrangement match test
             session_clips = [sub_layers[i] for i in range(4)]
             
-            # --- Arrangement view clips (named A/B/C/D → always override matching layer) ---
-            # Empty arrangement clips are intentional (e.g. section length markers); always override.
+            # --- Arrangement view clips (named A/B/C/D → always override session for that slot) ---
+            # Empty arrangement clips are intentional: they mean "no sequence" for that layer in that section.
             clip_timeable = find_element_by_tag(main_sequencer, 'ClipTimeable')
             if clip_timeable:
                 arr_automation = find_element_by_tag(clip_timeable, 'ArrangerAutomation')
@@ -2024,7 +2024,9 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                             layer_idx = _layer_name_to_idx.get(clip_name)
                             if layer_idx is not None:
                                 sub_layers[layer_idx] = arr_clip
-                                logger.info(f'  Track {track_idx}, Arrangement clip "{clip_name.upper()}": Overrides sub-layer {chr(65+layer_idx)}')
+                                sig = _midi_clip_signature(arr_clip)
+                                n_notes = sig[0] if sig else 0
+                                logger.info(f'  Track {track_idx}, Arrangement clip "{clip_name.upper()}": Overrides sub-layer {chr(65+layer_idx)} ({n_notes} notes)')
             
             # Test: when both session and arrangement provided a clip for the same layer, they should match
             for layer_idx in range(4):
@@ -2248,15 +2250,6 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                 if clip_length_beats <= 1.0:
                     logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Using default clip length = 1.0 beat')
                     clip_length_beats = 1.0
-            
-            # Extend note durations to fill the entire clip (arrangement view: notes should span to clip end)
-            if midi_clip and clip_length_beats > 0 and sublayer_events:
-                for event in sublayer_events:
-                    t = event.get('time_val', 0)
-                    fill_dur = max(0.0, clip_length_beats - t)
-                    if fill_dur > 0:
-                        event['dur_val'] = fill_dur
-                logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Extended note durations to fill clip ({clip_length_beats:.2f} beats)')
             
             # Track first layer with notes for activeseqlayer
             if sublayer_events and first_layer_with_notes == -1:
