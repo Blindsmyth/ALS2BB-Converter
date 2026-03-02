@@ -2262,10 +2262,9 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                     logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Using default clip length = 1.0 beat')
                     clip_length_beats = 1.0
             
-            # Sanity cap: avoid wrong step_count from misread clip length (e.g. 1/2 + 240 steps)
-            if clip_length_beats > 64.0:
-                logger.warning(f'    Sub-layer {chr(65+sublayer_idx)}: Capping clip_length_beats {clip_length_beats} at 64 (16 bars)')
-                clip_length_beats = 64.0
+            # Sanity cap only when clip_length came from CurrentEnd (unreliable - can be time in sec).
+            # LoopStart/LoopEnd and note-derived lengths are trusted; allow up to 256 beats (64 bars).
+            # CurrentEnd > 64 is already rejected above, so no extra cap needed for 32-bar clips.
             
             # Track first layer with notes for activeseqlayer
             if sublayer_events and first_layer_with_notes == -1:
@@ -2293,10 +2292,13 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
             # Step length values:
             # 14 = 1/32, 12 = 1/32T, 10 = 1/16, 11 = 1/16T, 8 = 1/8, 9 = 1/8T, 6 = 1/4, 4 = 1/2, 3 = 1 Bar, 2 = 2 Bars, 1 = 4 Bars, 0 = 8 Bars
             # 1 bar = 4 beats
-            # If no clip and no notes, use minimum length
-            if not midi_clip and len(sublayer_events) == 0:
-                step_len = 10  # 1/16 notes
-                step_count = 1  # Minimum length for empty sublayer
+            # Empty placeholder sublayers (clip exists, no notes): use 1 bar at 1/16 like main branch
+            if midi_clip and len(sublayer_events) == 0:
+                step_len = 10
+                step_count = 16
+            elif not midi_clip and len(sublayer_events) == 0:
+                step_len = 10
+                step_count = 1  # Truly empty slot
             else:
                 # For quantised sequences, use detected step_len (e.g., 14 for 1/32 notes)
                 # For unquantised, use default 1/16 (step_len=10)
@@ -2325,10 +2327,11 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                     step_len = 10
                     step_count = int(clip_length_beats * 4)
                 
-                # If step_count exceeds 256: prefer capping at 256 and keeping 1/16 when grid is 1/16 (avoids wrong 1/2 + 240)
-                if step_count > 256 and (not is_unquantised and detected_step_len == 10):
+                # If step_count exceeds 256: when grid is 1/16 and clip is short (<=64 beats), cap at 256
+                # (fixes misread clip_length e.g. from CurrentEnd). For long clips (>64 beats), coarsen to 1/8 etc.
+                if step_count > 256 and (not is_unquantised and detected_step_len == 10) and clip_length_beats <= 64.0:
                     step_count = min(256, step_count)
-                    logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Capping step_count at 256, keeping step_len=10 (1/16)')
+                    logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Capping step_count at 256, keeping step_len=10 (short clip)')
                 
                 # Otherwise use coarser resolution until step_count <= 256
                 if step_count > 256:
