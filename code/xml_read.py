@@ -2210,27 +2210,43 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                                     }
                                     sublayer_events.append(event_dict)
             
-            # Extract clip length from MIDI clip to calculate step_count
-            # LoopStart/LoopEnd are in beats; CurrentEnd can be in time (seconds) in some .als - do not trust large values.
+            # Extract clip length from MIDI clip to calculate step_count.
+            # Prefer play range (CurrentStart/CurrentEnd) - user may have cut a fragment from a longer clip.
+            # LoopStart/LoopEnd = loop region; CurrentStart/CurrentEnd = play range in beats (when in session).
             clip_length_beats = 1.0  # Default to 1 beat
             if midi_clip:
-                # Method 1: Try LoopStart/LoopEnd (reliable, in beats)
-                loop_start_elem = find_element_by_tag(midi_clip, 'LoopStart')
-                loop_end_elem = find_element_by_tag(midi_clip, 'LoopEnd')
-                
-                if loop_start_elem is not None and 'Value' in loop_start_elem.attrib and \
-                   loop_end_elem is not None and 'Value' in loop_end_elem.attrib:
+                # Method 1: CurrentStart/CurrentEnd = play range (what actually plays). Use when both present.
+                current_start_elem = find_element_by_tag(midi_clip, 'CurrentStart')
+                current_end_elem = find_element_by_tag(midi_clip, 'CurrentEnd')
+                if current_start_elem is not None and 'Value' in current_start_elem.attrib and \
+                   current_end_elem is not None and 'Value' in current_end_elem.attrib:
                     try:
-                        loop_start = float(loop_start_elem.attrib['Value'])
-                        loop_end = float(loop_end_elem.attrib['Value'])
-                        clip_length_beats = loop_end - loop_start
-                        if clip_length_beats <= 0:
-                            clip_length_beats = loop_end  # Use LoopEnd directly if difference is 0
-                        logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length from LoopStart/LoopEnd = {clip_length_beats} beats')
+                        cs = float(current_start_elem.attrib['Value'])
+                        ce = float(current_end_elem.attrib['Value'])
+                        play_range = ce - cs
+                        if play_range > 0 and play_range <= 256.0:
+                            clip_length_beats = play_range
+                            logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length from play range (CurrentEnd-CurrentStart) = {clip_length_beats} beats')
                     except (ValueError, TypeError) as e:
-                        logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Error extracting LoopStart/LoopEnd: {e}')
+                        logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Error CurrentStart/CurrentEnd: {e}')
                 
-                # Method 2: Derive from note positions (prefer over CurrentEnd when we have notes)
+                # Method 2: LoopStart/LoopEnd (loop region, in beats)
+                if clip_length_beats <= 1.0:
+                    loop_start_elem = find_element_by_tag(midi_clip, 'LoopStart')
+                    loop_end_elem = find_element_by_tag(midi_clip, 'LoopEnd')
+                    if loop_start_elem is not None and 'Value' in loop_start_elem.attrib and \
+                       loop_end_elem is not None and 'Value' in loop_end_elem.attrib:
+                        try:
+                            loop_start = float(loop_start_elem.attrib['Value'])
+                            loop_end = float(loop_end_elem.attrib['Value'])
+                            loop_len = loop_end - loop_start
+                            if loop_len > 0:
+                                clip_length_beats = loop_len
+                                logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length from LoopStart/LoopEnd = {clip_length_beats} beats')
+                        except (ValueError, TypeError) as e:
+                            logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Error LoopStart/LoopEnd: {e}')
+                
+                # Method 3: Derive from note positions when we have notes
                 if clip_length_beats <= 1.0 and len(sublayer_events) > 0:
                     max_time = 0.0
                     for event in sublayer_events:
@@ -2244,17 +2260,17 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                             clip_length_beats = max(4.0, max_time)
                         logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length from notes = {clip_length_beats} beats (max note end: {max_time:.3f})')
                 
-                # Method 3: CurrentEnd only if small (likely beats). Large values are often time in seconds.
+                # Method 4: CurrentEnd alone (fallback). Reject large values (likely time in sec).
                 if clip_length_beats <= 1.0:
-                    current_end_elem = find_element_by_tag(midi_clip, 'CurrentEnd')
-                    if current_end_elem is not None and 'Value' in current_end_elem.attrib:
+                    ce_elem = current_end_elem if current_end_elem is not None else find_element_by_tag(midi_clip, 'CurrentEnd')
+                    if ce_elem is not None and 'Value' in ce_elem.attrib:
                         try:
-                            current_end_val = float(current_end_elem.attrib['Value'])
-                            if current_end_val <= 64.0:
+                            current_end_val = float(ce_elem.attrib['Value'])
+                            if 0 < current_end_val <= 256.0:
                                 clip_length_beats = current_end_val
                                 logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length from CurrentEnd = {clip_length_beats} beats')
-                            else:
-                                logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: CurrentEnd={current_end_val} too large (likely time in sec), ignoring')
+                            elif current_end_val > 256.0:
+                                logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: CurrentEnd={current_end_val} too large, ignoring')
                         except (ValueError, TypeError):
                             pass
                 
