@@ -131,7 +131,7 @@ python3 xml_read.py -i "project.als" -o "output" -m -v | grep tempo
 | Project tempo | Global tempo | ✅ Works |
 | Track volume | Pad volume | ❌ Not yet |
 | Send effects | FX sends | ❌ Not yet |
-| Arrangement | Song mode | ❌ Not yet |
+| Arrangement | Song mode | ✅ Experimental (via `-s` flag) |
 
 ## Tips for Best Results
 
@@ -184,6 +184,9 @@ python3 xml_read.py -i "project.als" -o "output" -v
 
 # Full debug with manual samples
 python3 xml_read.py -i "project.als" -o "output" -m -v
+
+# Song mode (arrangement → Blackbox song sections)
+python3 xml_read.py -i "project.als" -o "output" -s
 
 # Show help
 python3 xml_read.py -h
