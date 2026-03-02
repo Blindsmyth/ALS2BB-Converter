@@ -1251,25 +1251,37 @@ def track_iterator(tracks):
     drum_rack = devices['DrumGroupDevice']
     pad_list = drum_rack_extract(drum_rack)
     
-    # Collect MIDI tracks following the drum rack track.
-    # Skips GroupTrack containers (seq tracks may be inside a group track), and stops
-    # once 16 MIDI tracks have been found.
+    # Collect the next 16 MIDI tracks after the drum (track 0). Flatten so we include
+    # MidiTracks inside GroupTracks (main branch expected flat tracks 2-17; with a group,
+    # the 16 seq tracks can be nested inside the group).
+    def iter_tracks_flattened(tracks_elem):
+        for t in tracks_elem:
+            if t.tag == 'MidiTrack':
+                yield t
+            elif t.tag == 'GroupTrack':
+                nested = find_element_by_tag(t, 'Tracks')
+                if nested is None:
+                    nested = t.find('TrackGroup')
+                if nested is not None:
+                    for child in nested:
+                        if child.tag == 'MidiTrack':
+                            yield child
     midi_tracks = []
-    midi_track_info = []  # Store (track, name, index) tuples
-    i = 1
-    while i < len(tracks) and len(midi_tracks) < 16:
-        track = tracks[i]
-        i += 1
+    midi_track_info = []
+    skipped_drum = False
+    for track in iter_tracks_flattened(tracks):
         if track.tag != 'MidiTrack':
-            logger.info(f'  Skipping non-MIDI track at index {i} (tag={track.tag})')
             continue
-        # Extract track name
+        if not skipped_drum:
+            skipped_drum = True
+            continue
         name_elem = find_element_by_tag(track, 'Name')
         track_name = name_elem.attrib.get('Value', '') if name_elem is not None else ''
         midi_tracks.append(track)
-        midi_track_info.append((track, track_name, len(midi_tracks)-1))
-        logger.info(f'  Found MIDI track at index {i} (name="{track_name}") for sequence (midi_tracks index {len(midi_tracks)-1})')
-    
+        midi_track_info.append((track, track_name, len(midi_tracks) - 1))
+        logger.info(f'  Found MIDI track (name="{track_name}") for sequence (midi_tracks index {len(midi_tracks)-1})')
+        if len(midi_tracks) >= 16:
+            break
     logger.info(f'Extracted {len(pad_list)} drum pads and {len(midi_tracks)} MIDI tracks')
     return pad_list, midi_tracks, midi_track_info
 
@@ -1277,16 +1289,15 @@ def track_iterator(tracks):
 # Helper functions for generating Blackbox XML
 
 def row_column(pad):
-    """
-    Blackbox 4x4 grid for 16 pads/sequences. Column-major order:
-    Pad 0->(0,0), 1->(1,0), 2->(2,0), 3->(3,0), 4->(0,1), ..., 15->(3,3).
-    """
-    p = int(pad)
-    if 0 <= p <= 15:
-        row = p % 4
-        column = p // 4
-        return (row, column)
-    return (0, 0)
+    rc_dict = {0:[0,0], 1:[0,1], 2:[0,2], 3:[0,3],
+               4:[1,0], 5:[1,1], 6:[1,2], 7:[1,3],
+               8:[2,0], 9:[2,1], 10:[2,2], 11:[2,3],
+               12:[3,0], 13:[3,1], 14:[3,2], 15:[3,3],
+               16:[0,4], 17:[1,4], 18:[2,4], 19:[3,4]}
+    rc = rc_dict.get(int(pad), [0, 0])
+    row = rc[0]
+    column = rc[1]
+    return (row, column)
 
 def pad_dicter(row, column, filename, type):
     cell_dict = {'row':str(row), 'column':str(column), 'layer':"0", 'filename':filename, 'type':type}
@@ -2200,10 +2211,10 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                                     sublayer_events.append(event_dict)
             
             # Extract clip length from MIDI clip to calculate step_count
-            # Try multiple methods: LoopEnd, CurrentEnd, or calculate from note positions
+            # LoopStart/LoopEnd are in beats; CurrentEnd can be in time (seconds) in some .als - do not trust large values.
             clip_length_beats = 1.0  # Default to 1 beat
             if midi_clip:
-                # Method 1: Try LoopStart/LoopEnd
+                # Method 1: Try LoopStart/LoopEnd (reliable, in beats)
                 loop_start_elem = find_element_by_tag(midi_clip, 'LoopStart')
                 loop_end_elem = find_element_by_tag(midi_clip, 'LoopEnd')
                 
@@ -2219,37 +2230,42 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                     except (ValueError, TypeError) as e:
                         logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Error extracting LoopStart/LoopEnd: {e}')
                 
-                # Method 2: If LoopEnd not found, try CurrentEnd
-                if clip_length_beats <= 1.0:
-                    current_end_elem = find_element_by_tag(midi_clip, 'CurrentEnd')
-                    if current_end_elem is not None and 'Value' in current_end_elem.attrib:
-                        try:
-                            clip_length_beats = float(current_end_elem.attrib['Value'])
-                            logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length from CurrentEnd = {clip_length_beats} beats')
-                        except (ValueError, TypeError):
-                            pass
-                
-                # Method 3: Calculate from note positions (use latest note end time)
+                # Method 2: Derive from note positions (prefer over CurrentEnd when we have notes)
                 if clip_length_beats <= 1.0 and len(sublayer_events) > 0:
                     max_time = 0.0
                     for event in sublayer_events:
-                        # Use original time_val and dur_val for accurate calculation
                         note_start_beats = event.get('time_val', 0)
                         note_duration_beats = event.get('dur_val', 0)
                         note_end_beats = note_start_beats + note_duration_beats
                         max_time = max(max_time, note_end_beats)
-                    
                     if max_time > 0:
-                        # Round up to nearest bar (4 beats) for sequence length
                         clip_length_beats = int((max_time + 3) // 4) * 4
                         if clip_length_beats < 4:
-                            clip_length_beats = max(4.0, max_time)  # At least 1 bar
-                        logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length calculated from notes = {clip_length_beats} beats (max note end: {max_time:.3f})')
+                            clip_length_beats = max(4.0, max_time)
+                        logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length from notes = {clip_length_beats} beats (max note end: {max_time:.3f})')
                 
-                # If still no length found, use default
+                # Method 3: CurrentEnd only if small (likely beats). Large values are often time in seconds.
+                if clip_length_beats <= 1.0:
+                    current_end_elem = find_element_by_tag(midi_clip, 'CurrentEnd')
+                    if current_end_elem is not None and 'Value' in current_end_elem.attrib:
+                        try:
+                            current_end_val = float(current_end_elem.attrib['Value'])
+                            if current_end_val <= 64.0:
+                                clip_length_beats = current_end_val
+                                logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length from CurrentEnd = {clip_length_beats} beats')
+                            else:
+                                logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: CurrentEnd={current_end_val} too large (likely time in sec), ignoring')
+                        except (ValueError, TypeError):
+                            pass
+                
                 if clip_length_beats <= 1.0:
                     logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Using default clip length = 1.0 beat')
                     clip_length_beats = 1.0
+            
+            # Sanity cap: avoid wrong step_count from misread clip length (e.g. 1/2 + 240 steps)
+            if clip_length_beats > 64.0:
+                logger.warning(f'    Sub-layer {chr(65+sublayer_idx)}: Capping clip_length_beats {clip_length_beats} at 64 (16 bars)')
+                clip_length_beats = 64.0
             
             # Track first layer with notes for activeseqlayer
             if sublayer_events and first_layer_with_notes == -1:
@@ -2309,7 +2325,12 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                     step_len = 10
                     step_count = int(clip_length_beats * 4)
                 
-                # If step_count exceeds 256, use coarser resolution
+                # If step_count exceeds 256: prefer capping at 256 and keeping 1/16 when grid is 1/16 (avoids wrong 1/2 + 240)
+                if step_count > 256 and (not is_unquantised and detected_step_len == 10):
+                    step_count = min(256, step_count)
+                    logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Capping step_count at 256, keeping step_len=10 (1/16)')
+                
+                # Otherwise use coarser resolution until step_count <= 256
                 if step_count > 256:
                     # Try 1/8 notes: 1 beat = 2 steps, 1 bar = 8 steps
                     step_count = int(clip_length_beats * 2)
@@ -3422,9 +3443,9 @@ if __name__ == '__main__':
             sys.exit(1)
         args.Output = os.path.join(args.Output, f'v{args.Version}')
     elif git_version:
-        # Automatically use git commit hash as version name
+        # Use git commit hash so output folder matches the code version
         args.Output = os.path.join(args.Output, f'v{git_version}')
-        logger.info(f'Using git commit hash as version: v{git_version}')
+        logger.info(f'Using git commit hash: v{git_version}')
     
     if args.verbose:
         logger.setLevel(logging.DEBUG)
