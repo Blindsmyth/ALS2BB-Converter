@@ -2076,12 +2076,11 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                                 
                                 # Determine chan and pitch based on sequence mode
                                 if seq_mode == 'Pads':
-                                    # Pads mode: include ALL notes from the clip. Each note's pitch = which pad it
-                                    # triggers (from drum rack map). Do NOT filter by target_pad — that was added
-                                    # to fix "stray note in seq 13" but it dropped valid notes (e.g. seq 1 beat).
-                                    # Section extraction (which pad ON in a section) uses C1=pad0 etc. separately.
-                                    event_chan = 256 + sequence_location_pad  # All notes in this sequence cell
-                                    event_pitch = midi_to_pad.get(midi_note, sequence_location_pad)  # Per-note pad from drum rack; fallback to this cell's pad
+                                    # Pads mode: include ALL notes from the clip (no filter). Use pitch=sequence_location_pad
+                                    # for every note so the cell has a single pitch = Pads display on the device.
+                                    # Multiple pitches per cell = Keys display (wrong). Filter was removed (dropped seq 1 beat).
+                                    event_chan = 256 + sequence_location_pad
+                                    event_pitch = sequence_location_pad
                                 elif seq_mode == 'Keys':
                                     # Keys mode: chan depends on quantisation state
                                     # - Quantised: chan=256+target_pad (seqstepmode="1")
@@ -3301,10 +3300,129 @@ def _section_content_from_root(root):
     return out
 
 
-def compare_section_content(expected_preset_path, actual_preset_path, max_sections=8):
+def _cell_key(cell):
+    """Return a sortable key for a session cell: (row, col, layer, type, seqsublayer)."""
+    r = int(cell.get('row', 0) or 0)
+    c = int(cell.get('column', 0) or 0)
+    ly = int(cell.get('layer', 0) or 0)
+    t = cell.get('type', '') or ''
+    sub = cell.get('seqsublayer', '') or ''
+    if t == 'noteseq' and sub == '':
+        sub = '0'
+    if t == 'section':  # Sections don't use seqsublayer; normalize to ''
+        sub = ''
+    return (r, c, ly, t, sub)
+
+
+def _norm_attr(k, v):
+    """Normalize attribute value for comparison. Return (normalized_value, compare_basename_only)."""
+    if k == 'filename' and v:
+        return (os.path.basename(v.strip()).lower(), True)  # Compare basename only
+    return (v, False)
+
+
+def _attrs_match(exp_attrib, act_attrib, path, diffs, ignore_attrs=None):
+    """Compare element attributes. Append to diffs on mismatch."""
+    ignore = set(ignore_attrs or [])
+    exp_keys = set(k for k in exp_attrib if k not in ignore)
+    act_keys = set(k for k in act_attrib if k not in ignore)
+    if exp_keys != act_keys:
+        only_exp = exp_keys - act_keys
+        only_act = act_keys - exp_keys
+        if only_exp or only_act:
+            diffs.append(f"{path}: attr keys differ (only in expected: {only_exp}, only in actual: {only_act})")
+    for k in sorted(exp_keys | act_keys):
+        ev, _ = _norm_attr(k, exp_attrib.get(k, ''))
+        av, _ = _norm_attr(k, act_attrib.get(k, ''))
+        if ev != av:
+            diffs.append(f"{path} @{k}: expected={ev!r} actual={av!r}")
+
+
+def _params_match(exp_params, act_params, path, diffs):
+    """Compare params element attributes (often many key=value)."""
+    if exp_params is None and act_params is None:
+        return True
+    if exp_params is None or act_params is None:
+        diffs.append(f"{path}: params missing in one (exp={exp_params is not None}, act={act_params is not None})")
+        return False
+    exp_a = dict(exp_params.attrib)
+    act_a = dict(act_params.attrib)
+    # Empty string and '0' are often equivalent for optional numeric params
+    def _norm_param(v):
+        if v in ('', None):
+            return '0'
+        return v
+    for k in set(exp_a) | set(act_a):
+        ev = _norm_param(exp_a.get(k, ''))
+        av = _norm_param(act_a.get(k, ''))
+        if ev != av:
+            try:
+                en, an = float(ev), float(av)
+                if abs(en - an) <= 1.0:  # Allow small tolerance for sample positions
+                    continue
+            except (ValueError, TypeError):
+                pass
+            # deftemplate '1' vs '' - treat as significant
+            if k == 'deftemplate' and {ev, av} <= {'', '0', '1'} and ev != av:
+                pass  # Report
+            diffs.append(f"{path} params[{k}]: expected={exp_a.get(k,'')!r} actual={act_a.get(k,'')!r}")
+
+
+def _seqevent_str(ev):
+    """Canonical string for a seqevent (order of attrs matters for comparison)."""
+    keys = ['step', 'chan', 'type', 'strtks', 'lencount', 'lentks', 'pitch', 'velocity', 'cond', 'silayer']
+    parts = [f"{k}={ev.get(k, '')}" for k in keys if k in ev.attrib]
+    return ' '.join(parts)
+
+
+def _compare_cell(exp_cell, act_cell, path, diffs):
+    """Compare two cell elements (and their descendants)."""
+    cell_type = exp_cell.get('type', '') or act_cell.get('type', '')
+    _attrs_match(exp_cell.attrib, act_cell.attrib, path, diffs)
+    exp_params = exp_cell.find('params')
+    act_params = act_cell.find('params')
+    _params_match(exp_params, act_params, path, diffs)
+    # Only compare note seqevents in noteseq cells; section cells use sceneitem events (handled by _section_content)
+    if cell_type == 'noteseq':
+        exp_seq = exp_cell.find('sequence')
+        act_seq = act_cell.find('sequence')
+        if (exp_seq is None) != (act_seq is None):
+            diffs.append(f"{path}: sequence element in one but not other")
+        elif exp_seq is not None and act_seq is not None:
+            exp_evs = sorted([_seqevent_str(e) for e in exp_seq.findall('seqevent') if e.get('type') == 'note'])
+            act_evs = sorted([_seqevent_str(e) for e in act_seq.findall('seqevent') if e.get('type') == 'note'])
+            if exp_evs != act_evs:
+                diffs.append(f"{path} sequence: expected {len(exp_evs)} note events, actual {len(act_evs)}")
+                for i, (e, a) in enumerate(zip(exp_evs, act_evs)):
+                    if e != a:
+                        diffs.append(f"  event[{i}]: exp={e}")
+                        diffs.append(f"         act={a}")
+                if len(exp_evs) != len(act_evs):
+                    for ex in exp_evs[len(act_evs):]:
+                        diffs.append(f"  extra expected: {ex}")
+                    for ax in act_evs[len(exp_evs):]:
+                        diffs.append(f"  extra actual: {ax}")
+    # modsource, slices: compare structure
+    for child_tag in ['modsource', 'slices']:
+        exp_ch = list(exp_cell.findall(child_tag))
+        act_ch = list(act_cell.findall(child_tag))
+        if len(exp_ch) != len(act_ch):
+            diffs.append(f"{path}: {child_tag} count exp={len(exp_ch)} act={len(act_ch)}")
+        for i, (ec, ac) in enumerate(zip(exp_ch, act_ch)):
+            _attrs_match(ec.attrib, ac.attrib, f"{path}/{child_tag}[{i}]", diffs)
+            for sc in ['slice']:
+                es = list(ec.findall(sc))
+                as_ = list(ac.findall(sc))
+                if len(es) != len(as_):
+                    diffs.append(f"{path}/{child_tag}[{i}]/{sc}: count exp={len(es)} act={len(as_)}")
+                for j, (s1, s2) in enumerate(zip(es, as_)):
+                    _attrs_match(s1.attrib, s2.attrib, f"{path}/{child_tag}[{i}]/{sc}[{j}]", diffs)
+
+
+def compare_preset_xml(expected_preset_path, actual_preset_path):
     """
-    Compare song section content (name, repeats, pad/seq conds) between expected and actual preset XML.
-    Logs differences and returns number of mismatches.
+    Compare the whole preset XML: session cells (pads, sequences), params, seqevents, song sections, etc.
+    Returns number of mismatches. Logs all differences.
     """
     try:
         with open(expected_preset_path, 'r') as f:
@@ -3319,33 +3437,57 @@ def compare_section_content(expected_preset_path, actual_preset_path, max_sectio
         logger.warning(f"Cannot load actual preset for comparison: {e}")
         return -1
 
+    diffs = []
+    exp_sess = exp_root.find('session')
+    act_sess = act_root.find('session')
+    if exp_sess is None or act_sess is None:
+        diffs.append("session element missing in one file")
+    else:
+        exp_cells = {_cell_key(c): c for c in exp_sess.findall('cell')}
+        act_cells = {_cell_key(c): c for c in act_sess.findall('cell')}
+        all_keys = sorted(set(exp_cells) | set(act_cells))
+        for key in all_keys:
+            r, c, ly, t, sub = key
+            path = f"session cell row={r} col={c} layer={ly} type={t} sub={sub}"
+            if key not in exp_cells:
+                diffs.append(f"{path}: in actual but not expected")
+                continue
+            if key not in act_cells:
+                diffs.append(f"{path}: in expected but not actual")
+                continue
+            # Section content compared separately; skip params/children for section cells
+            if t == 'section':
+                continue
+            _compare_cell(exp_cells[key], act_cells[key], path, diffs)
+
+    # Compare song sections (layer=2, type=section)
     exp_sec = _section_content_from_root(exp_root)
     act_sec = _section_content_from_root(act_root)
-    n = min(max_sections, len(exp_sec), len(act_sec))
-    mismatches = 0
-    logger.info('=== Song section content comparison (expected vs actual) ===')
+    n = max(len(exp_sec), len(act_sec))
     for i in range(n):
-        e = exp_sec[i]
-        a = act_sec[i]
-        name_ok = e['name'] == a['name']
-        rep_ok = e['repeats'] == a['repeats']
-        # pad_conds: (pad_idx, silayer) -> cond; pad "on" = any cond>=1
-        pad_on_exp = {k for k, c in e['pad_conds'].items() if c >= 1}
-        pad_on_act = {k for k, c in a['pad_conds'].items() if c >= 1}
-        seq_on_exp = {k for k, c in e['seq_conds'].items() if c >= 1}
-        seq_on_act = {k for k, c in a['seq_conds'].items() if c >= 1}
-        pad_ok = pad_on_exp == pad_on_act
-        seq_ok = seq_on_exp == seq_on_act
-        if not (name_ok and rep_ok and pad_ok and seq_ok):
-            mismatches += 1
-            logger.warning(
-                f"  Section {i} {e['name']!r}: repeats exp={e['repeats']} act={a['repeats']} {'OK' if rep_ok else 'MISMATCH'}; "
-                f"pads ON exp={sorted(pad_on_exp)} act={sorted(pad_on_act)} {'OK' if pad_ok else 'MISMATCH'}; "
-                f"seqs ON exp={sorted(seq_on_exp)} act={sorted(seq_on_act)} {'OK' if seq_ok else 'MISMATCH'}"
+        e = exp_sec[i] if i < len(exp_sec) else {}
+        a = act_sec[i] if i < len(act_sec) else {}
+        name_ok = e.get('name', '') == a.get('name', '')
+        rep_ok = e.get('repeats', 1) == a.get('repeats', 1)
+        pad_on_exp = {k for k, c in e.get('pad_conds', {}).items() if c >= 1}
+        pad_on_act = {k for k, c in a.get('pad_conds', {}).items() if c >= 1}
+        seq_on_exp = {k for k, c in e.get('seq_conds', {}).items() if c >= 1}
+        seq_on_act = {k for k, c in a.get('seq_conds', {}).items() if c >= 1}
+        if not (name_ok and rep_ok and pad_on_exp == pad_on_act and seq_on_exp == seq_on_act):
+            diffs.append(
+                f"section[{i}] {e.get('name','')!r}: repeats exp={e.get('repeats')} act={a.get('repeats')}; "
+                f"pads ON exp={sorted(pad_on_exp)} act={sorted(pad_on_act)}; "
+                f"seqs ON exp={sorted(seq_on_exp)} act={sorted(seq_on_act)}"
             )
-    if mismatches == 0 and n > 0:
-        logger.info(f'  All {n} section(s) match expected (name, repeats, pad/seq ON).')
-    return mismatches
+
+    logger.info('=== Full preset XML comparison (expected vs actual) ===')
+    for d in diffs[:100]:  # Cap output
+        logger.warning(f"  {d}")
+    if len(diffs) > 100:
+        logger.warning(f"  ... and {len(diffs) - 100} more")
+    if not diffs:
+        logger.info('  Preset matches expected (pads, sequences, params, seqevents, song sections).')
+    return len(diffs)
 
 
 def main(args):
@@ -3430,7 +3572,10 @@ def main(args):
         save_xml(bb_root, preset_filepath)
         
         if getattr(args, 'compare', None):
-            compare_section_content(args.compare, preset_filepath, max_sections=8)
+            mismatches = compare_preset_xml(args.compare, preset_filepath)
+            if mismatches > 0:
+                logger.error(f'Comparison FAILED: {mismatches} mismatch(es). Output does not match expected preset.')
+                sys.exit(1)
         
         logger.info('=== Conversion complete! ===')
         logger.info(f'Output saved to: {args.Output}')
@@ -3470,7 +3615,7 @@ if __name__ == '__main__':
     parser.add_argument("-m", "--Manual", help="Manual sample extraction (don't copy samples)", action='store_true')
     parser.add_argument("-u", "--unquantised", help="Unquantised MIDI timing (precise timing, not grid-locked)", action='store_true')
     parser.add_argument("-s", "--song-mode", help="Enable song mode: map arrangement locators and clips to Blackbox song sections", action='store_true')
-    parser.add_argument("-c", "--compare", help="After conversion, compare section content (name, repeats, pad/seq ON) to this expected preset XML path", type=str, default=None)
+    parser.add_argument("-c", "--compare", help="After conversion, compare full preset XML to expected file. Exit 1 if any mismatch.", type=str, default=None)
     parser.add_argument("-v", "--verbose", help="Verbose output", action='store_true')
     args = parser.parse_args()
     
