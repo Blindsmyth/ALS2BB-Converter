@@ -1970,6 +1970,11 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                 logger.warning(f'  Keys mode: Branch Id {branch_id} not found in drum rack')
                 logger.warning(f'  Falling back to track position (Pad {track_idx})')
                 target_pad = track_idx
+            # Track N → Pad N = standard "one sequence per pad" setup → treat as Pads, not Keys
+            if target_pad == track_idx:
+                logger.info(f'  Treating as Pads mode (track {track_idx} → pad {target_pad}, 1:1)')
+                seq_mode = 'Pads'
+                mode_target = None
         
         # For row/column calculation:
         # CRITICAL: Sequence location (row/column) ALWAYS matches track index for both Pads and Keys mode
