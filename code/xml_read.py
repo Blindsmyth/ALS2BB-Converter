@@ -2137,10 +2137,12 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                                 
                                 # Determine chan and pitch based on sequence mode
                                 if seq_mode == 'Pads':
-                                    # Pads mode: chan determines pad, pitch is always 0
+                                    # Pads mode: this sequence is for one pad only. Only include notes that map to this pad.
                                     pad_number = midi_to_pad.get(midi_note, 0)
-                                    event_chan = 256 + pad_number
-                                    event_pitch = 0
+                                    if pad_number != target_pad:
+                                        continue  # Stray KeyTrack (e.g. F1→pad 6): skip so it doesn't appear in seq 13
+                                    event_chan = 256 + sequence_location_pad  # All notes in this sequence cell
+                                    event_pitch = sequence_location_pad       # Each note triggers this pad
                                 elif seq_mode == 'Keys':
                                     # Keys mode: chan depends on quantisation state
                                     # - Quantised: chan=256+target_pad (seqstepmode="1")
@@ -2460,11 +2462,9 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                     # Recalculate step based on detected step_len (e.g., 8 steps/beat for 1/32 notes)
                     event['step'] = int(time_val * steps_per_beat)
                     # Recalculate strtks with 3840 ticks/beat for quantised sequences (both Keys and Pads mode)
-                    # CRITICAL: For quantised sequences, lentks should be constant 960 ticks (matches reference format)
-                    # This ensures step mode is ON (quantised) on the device
                     event['strtks'] = int(time_val * 3840)  # 3840 ticks/beat for quantised
-                    event['lentks'] = 960  # Constant 960 ticks for quantised sequences (matches reference)
-                    # Recalculate lencount based on detected step_len (steps_per_beat)
+                    # Preserve note length: use actual duration from clip (quantised sequences keep lengths)
+                    event['lentks'] = max(240, int(dur_val * 3840))  # 240 ticks min; otherwise exact duration
                     event['lencount'] = max(1, int(dur_val * steps_per_beat))  # Step-based length for quantised
             
             # Create cell element for this sublayer
