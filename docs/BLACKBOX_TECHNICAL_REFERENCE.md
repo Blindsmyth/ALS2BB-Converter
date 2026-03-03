@@ -76,6 +76,19 @@ The `notesteplen` parameter controls the length of time the sequence will spend 
 
 ## Sequence Events
 
+### Display: Pads vs Keys View (Hardware Verified)
+
+The device shows either **Pads** (pad numbers 0–15) or **Keys** (piano keyboard) in the sequence editor. This is determined by **chan** and **pitch**:
+
+- **chan 0–15**: Always Keys layout (MIDI channel range)
+- **chan 256–271**: Pads layout *unless* pitch is in MIDI range
+  - **pitch 0–15**: Pads display (pad-like values)
+  - **pitch 36+** (MIDI notes): Keys display — pitch overrides chan
+
+**For Pads display**: Use `chan = 256 + pad` and `pitch = 0` (or 0–15). **Never** use raw MIDI pitch values (36, 37, 40, 60, etc.) when targeting Pads mode — the device will show Keys.
+
+*Verified with chan_pitch_hw_test preset, March 2025.*
+
 ### Event Attributes:
 - `step`: Step position in the sequence (0-based)
 - `chan`: Channel number
@@ -83,7 +96,7 @@ The `notesteplen` parameter controls the length of time the sequence will spend 
   - **Keys/MIDI Mode**: Standard MIDI channel
 - `type`: Event type (typically "note")
 - `pitch`: Pitch value
-  - **Pads Mode**: Always `0` (pitch doesn't determine pad in pads mode, `chan` does)
+  - **Pads Mode**: Use `0` (or 0–15) for Pads display. MIDI pitches (36+) force Keys display.
   - **Keys/MIDI Mode**: MIDI note number (0-127)
 - `strtks`: Start time in ticks (1 beat = 3840 ticks)
 - `lencount`: Length in step counts
