@@ -70,7 +70,6 @@ These small utility functions remain unchanged:
 - `detect_note_grid_pattern()` - Detects quantised vs unquantised sequences
 - `make_drum_rack_pads()` - Creates pads from Drum Rack (replaces `make_pads()`)
 - `make_drum_rack_sequences()` - Creates sequences from MIDI tracks (replaces `make_sequences()`)
-- `extract_first_midi_note_from_track()` - Extracts MIDI notes for pad mapping
 - `find_tempo()` - Enhanced tempo extraction with multiple fallback methods
 - `find_tracks()` - Enhanced track finding with better error handling
 - `indent_xml()` - Pretty-prints XML output for readability

@@ -167,48 +167,6 @@ def find_element_by_tag(parent, tag):
     return None
 
 
-def extract_first_midi_note_from_track(midi_track):
-    """
-    Extract the first MIDI note played in any clip of this MIDI track.
-    Used for Keys mode to determine which pad the sequence targets.
-    
-    Returns:
-        int: MIDI note number, or None if no notes found
-    """
-    try:
-        device_chain = find_element_by_tag(midi_track, 'DeviceChain')
-        if not device_chain:
-            return None
-        
-        main_sequencer = find_element_by_tag(device_chain, 'MainSequencer')
-        if not main_sequencer:
-            return None
-        
-        clip_slot_list = find_element_by_tag(main_sequencer, 'ClipSlotList')
-        if not clip_slot_list:
-            return None
-        
-        # Check all clip slots for a MIDI clip
-        for clip_slot in list(clip_slot_list):
-            if len(clip_slot) > 1:
-                clip_slot_value = clip_slot[1]
-                if len(clip_slot_value) > 0:
-                    midi_clip = clip_slot_value[0][0]
-                    notes = midi_clip.find('.//Notes/KeyTracks')
-                    if notes and len(notes) > 0:
-                        # Get first key track
-                        key_track = notes[0]
-                        midi_key = find_element_by_tag(key_track, 'MidiKey')
-                        if midi_key and 'Value' in midi_key.attrib:
-                            return int(midi_key.attrib['Value'])
-        
-        return None
-        
-    except Exception as e:
-        logger.debug(f'  Error extracting MIDI note: {e}')
-        return None
-
-
 def detect_sequence_mode(midi_track):
     """
     Detect the sequence mode for a MIDI track based on its routing.
@@ -220,7 +178,10 @@ def detect_sequence_mode(midi_track):
     
     Routing patterns (examples from Ableton 12):
         - Keys Mode: MidiOut/Track.XX/DeviceIn.Y.BZ (routed to specific drum rack pad via Branch Id Z)
-        - Pads Mode (default): MidiOut/Track.XX/DeviceIn.Y.0 or MidiOut/Track.XX/TrackIn or MidiOut/None
+        - Pads Mode: MidiOut/Track.XX/DeviceIn.Y.0 (routed to drum rack as a whole) or
+          MidiOut/Track.XX/TrackIn or MidiOut/None. We use "routing to drum rack" (DeviceIn without
+          branch id), not "track in of pads track"; the 16 seq tracks are then forced to Pads in
+          make_drum_rack_sequences so track N -> pad N.
         - MIDI Mode: MidiOut/External.Dev:DeviceName/Channel (routed to external MIDI)
     """
     try:
@@ -1942,39 +1903,19 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
         # Detect sequence mode for this track
         seq_mode, mode_target = detect_sequence_mode(track)
         
+        # Standard project: 16 sequence tracks = one per pad (track N → pad N). Always treat as Pads.
+        # This avoids mis-detection as Keys when Ableton uses DeviceIn with branch-style routing.
+        if track_idx < 16:
+            seq_mode = 'Pads'
+            mode_target = None
+        
         # Get track name for logging/identification (track names like "Seq1", "Seq2" are just labels)
         track_name = None
         if midi_track_info and track_idx < len(midi_track_info):
             track_name = midi_track_info[track_idx][1]
         
-        # Determine target pad from routing (not from track name or index)
-        # For Keys mode: routing to specific pad via branch_id determines target_pad
-        # For Pads mode: sequence location is ALWAYS determined by track index (CRITICAL: must match track_idx)
-        target_pad = track_idx  # Default: use track index for sequence location
-        
-        if seq_mode == 'Keys' and mode_target is not None:
-            # mode_target is the branch_id from the routing (e.g., B40 → 40)
-            branch_id = mode_target
-            
-            # Find which pad has this branch_id
-            target_found = False
-            for pad in pad_list:
-                if pad.get('branch_id') == branch_id:
-                    target_pad = pad['blackbox_pad']
-                    target_found = True
-                    logger.info(f'  Keys mode: Branch Id {branch_id} maps to Pad {target_pad}')
-                    break
-            
-            if not target_found:
-                # Branch Id not found, fall back to track position
-                logger.warning(f'  Keys mode: Branch Id {branch_id} not found in drum rack')
-                logger.warning(f'  Falling back to track position (Pad {track_idx})')
-                target_pad = track_idx
-            # Track N → Pad N = standard "one sequence per pad" setup → treat as Pads, not Keys
-            if target_pad == track_idx:
-                logger.info(f'  Treating as Pads mode (track {track_idx} → pad {target_pad}, 1:1)')
-                seq_mode = 'Pads'
-                mode_target = None
+        # For Pads mode: sequence location and target pad = track index
+        target_pad = track_idx
         
         # For row/column calculation:
         # CRITICAL: Sequence location (row/column) ALWAYS matches track index for both Pads and Keys mode
@@ -1998,78 +1939,71 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
         _layer_name_to_idx = {'a': 0, 'b': 1, 'c': 2, 'd': 3}
         
         try:
-            device_chain = find_element_by_tag(track, 'DeviceChain')
-            if not device_chain:
-                logger.debug(f'  Track {track_idx}: No DeviceChain found')
-                continue
+            device_chain = find_element_by_tag(track, 'DeviceChain') if track is not None else None
+            main_sequencer = find_element_by_tag(device_chain, 'MainSequencer') if device_chain is not None else None
             
-            main_sequencer = find_element_by_tag(device_chain, 'MainSequencer')
-            if not main_sequencer:
-                logger.debug(f'  Track {track_idx}: No MainSequencer found')
-                continue
-            
-            # --- Session view clips (slots 0-3 → layers A/B/C/D) ---
-            clip_slot_list = find_element_by_tag(main_sequencer, 'ClipSlotList')
-            if clip_slot_list:
-                for clip_idx, clip_slot_container in enumerate(clip_slot_list[:4]):
-                    if len(clip_slot_container) > 1:
-                        clip_slot = clip_slot_container[1]
-                        if clip_slot.tag == 'ClipSlot' and len(clip_slot) > 0:
-                            value_elem = clip_slot[0]
-                            if value_elem.tag == 'Value' and len(value_elem) > 0:
-                                if value_elem[0].tag == 'MidiClip':
-                                    sub_layers[clip_idx] = value_elem[0]
-                                    logger.info(f'  Track {track_idx}, Session slot {clip_idx}: Found clip for sub-layer {chr(65+clip_idx)}')
-            
-            # Keep copy of session clips for session-vs-arrangement match test
-            session_clips = [sub_layers[i] for i in range(4)]
-            
-            # --- Arrangement view clips (named A/B/C/D → always override session for that slot) ---
-            # Empty arrangement clips are intentional: they mean "no sequence" for that layer in that section.
-            clip_timeable = find_element_by_tag(main_sequencer, 'ClipTimeable')
-            if clip_timeable:
-                arr_automation = find_element_by_tag(clip_timeable, 'ArrangerAutomation')
-                if arr_automation:
-                    events = find_element_by_tag(arr_automation, 'Events')
-                    if events:
-                        for arr_clip in events:
-                            if arr_clip.tag != 'MidiClip':
-                                continue
-                            name_el = find_element_by_tag(arr_clip, 'Name')
-                            clip_name = (name_el.attrib.get('Value', '') if name_el is not None else '').strip().lower()
-                            layer_idx = _layer_name_to_idx.get(clip_name)
-                            if layer_idx is not None:
-                                sub_layers[layer_idx] = arr_clip
-                                sig = _midi_clip_signature(arr_clip)
-                                n_notes = sig[0] if sig else 0
-                                logger.info(f'  Track {track_idx}, Arrangement clip "{clip_name.upper()}": Overrides sub-layer {chr(65+layer_idx)} ({n_notes} notes)')
-            
-            # Test: when both session and arrangement provided a clip for the same layer, they should match
-            for layer_idx in range(4):
-                sess_clip = session_clips[layer_idx] if layer_idx < len(session_clips) else None
-                final_clip = sub_layers[layer_idx] if layer_idx < len(sub_layers) else None
-                if sess_clip is None or final_clip is None or sess_clip is final_clip:
-                    continue
-                sig_sess = _midi_clip_signature(sess_clip)
-                sig_arr = _midi_clip_signature(final_clip)
-                if sig_sess is None and sig_arr is None:
-                    continue
-                if sig_sess is None or sig_arr is None:
-                    logger.warning(f'  Track {track_idx}, layer {chr(65+layer_idx)}: session vs arrangement signature missing (session={sig_sess}, arr={sig_arr})')
-                    continue
-                n_sess, len_sess, notes_sess = sig_sess
-                n_arr, len_arr, notes_arr = sig_arr
-                if n_sess != n_arr or abs(len_sess - len_arr) > 0.001 or notes_sess != notes_arr:
-                    logger.warning(
-                        f'  Track {track_idx}, layer {chr(65+layer_idx)}: session view clip does NOT match arrangement clip '
-                        f'(session: {n_sess} notes, {len_sess:.2f} beats; arrangement: {n_arr} notes, {len_arr:.2f} beats)'
-                    )
-                else:
-                    logger.info(f'  Track {track_idx}, layer {chr(65+layer_idx)}: session and arrangement clips match ({n_sess} notes, {len_sess:.2f} beats)')
+            if device_chain is not None and main_sequencer is not None:
+                # --- Session view clips (slots 0-3 → layers A/B/C/D) ---
+                clip_slot_list = find_element_by_tag(main_sequencer, 'ClipSlotList')
+                if clip_slot_list:
+                    for clip_idx, clip_slot_container in enumerate(clip_slot_list[:4]):
+                        if len(clip_slot_container) > 1:
+                            clip_slot = clip_slot_container[1]
+                            if clip_slot.tag == 'ClipSlot' and len(clip_slot) > 0:
+                                value_elem = clip_slot[0]
+                                if value_elem.tag == 'Value' and len(value_elem) > 0:
+                                    if value_elem[0].tag == 'MidiClip':
+                                        sub_layers[clip_idx] = value_elem[0]
+                                        logger.info(f'  Track {track_idx}, Session slot {clip_idx}: Found clip for sub-layer {chr(65+clip_idx)}')
+                
+                # Keep copy of session clips for session-vs-arrangement match test
+                session_clips = [sub_layers[i] for i in range(4)]
+                
+                # --- Arrangement view clips (named A/B/C/D → always override session for that slot) ---
+                clip_timeable = find_element_by_tag(main_sequencer, 'ClipTimeable')
+                if clip_timeable:
+                    arr_automation = find_element_by_tag(clip_timeable, 'ArrangerAutomation')
+                    if arr_automation:
+                        events = find_element_by_tag(arr_automation, 'Events')
+                        if events:
+                            for arr_clip in events:
+                                if arr_clip.tag != 'MidiClip':
+                                    continue
+                                name_el = find_element_by_tag(arr_clip, 'Name')
+                                clip_name = (name_el.attrib.get('Value', '') if name_el is not None else '').strip().lower()
+                                layer_idx = _layer_name_to_idx.get(clip_name)
+                                if layer_idx is not None:
+                                    sub_layers[layer_idx] = arr_clip
+                                    sig = _midi_clip_signature(arr_clip)
+                                    n_notes = sig[0] if sig else 0
+                                    logger.info(f'  Track {track_idx}, Arrangement clip "{clip_name.upper()}": Overrides sub-layer {chr(65+layer_idx)} ({n_notes} notes)')
+                
+                # Test: when both session and arrangement provided a clip for the same layer, they should match
+                for layer_idx in range(4):
+                    sess_clip = session_clips[layer_idx] if layer_idx < len(session_clips) else None
+                    final_clip = sub_layers[layer_idx] if layer_idx < len(sub_layers) else None
+                    if sess_clip is None or final_clip is None or sess_clip is final_clip:
+                        continue
+                    sig_sess = _midi_clip_signature(sess_clip)
+                    sig_arr = _midi_clip_signature(final_clip)
+                    if sig_sess is None and sig_arr is None:
+                        continue
+                    if sig_sess is None or sig_arr is None:
+                        logger.warning(f'  Track {track_idx}, layer {chr(65+layer_idx)}: session vs arrangement signature missing (session={sig_sess}, arr={sig_arr})')
+                        continue
+                    n_sess, len_sess, notes_sess = sig_sess
+                    n_arr, len_arr, notes_arr = sig_arr
+                    if n_sess != n_arr or abs(len_sess - len_arr) > 0.001 or notes_sess != notes_arr:
+                        logger.warning(
+                            f'  Track {track_idx}, layer {chr(65+layer_idx)}: session view clip does NOT match arrangement clip '
+                            f'(session: {n_sess} notes, {len_sess:.2f} beats; arrangement: {n_arr} notes, {len_arr:.2f} beats)'
+                        )
+                    else:
+                        logger.info(f'  Track {track_idx}, layer {chr(65+layer_idx)}: session and arrangement clips match ({n_sess} notes, {len_sess:.2f} beats)')
         
         except Exception as e:
             logger.warning(f"Error extracting MIDI clips from track {track_idx}: {e}")
-            continue
+            # Do not continue: still create 4 empty sublayer cells so this sequence slot is not missing
         
         # Trim trailing None entries so sublayer loop matches actual data
         while sub_layers and sub_layers[-1] is None:
@@ -2142,12 +2076,12 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                                 
                                 # Determine chan and pitch based on sequence mode
                                 if seq_mode == 'Pads':
-                                    # Pads mode: this sequence is for one pad only. Only include notes that map to this pad.
-                                    pad_number = midi_to_pad.get(midi_note, 0)
-                                    if pad_number != target_pad:
-                                        continue  # Stray KeyTrack (e.g. F1→pad 6): skip so it doesn't appear in seq 13
+                                    # Pads mode: include ALL notes from the clip. Each note's pitch = which pad it
+                                    # triggers (from drum rack map). Do NOT filter by target_pad — that was added
+                                    # to fix "stray note in seq 13" but it dropped valid notes (e.g. seq 1 beat).
+                                    # Section extraction (which pad ON in a section) uses C1=pad0 etc. separately.
                                     event_chan = 256 + sequence_location_pad  # All notes in this sequence cell
-                                    event_pitch = sequence_location_pad       # Each note triggers this pad
+                                    event_pitch = midi_to_pad.get(midi_note, sequence_location_pad)  # Per-note pad from drum rack; fallback to this cell's pad
                                 elif seq_mode == 'Keys':
                                     # Keys mode: chan depends on quantisation state
                                     # - Quantised: chan=256+target_pad (seqstepmode="1")
@@ -3541,32 +3475,37 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     # Get git commit hash for versioning (if in a git repo)
+    # Hash is taken from the repo containing this script (ableton_blackbox). After you push, run
+    # convert again so the new output goes to a new folder (e.g. out_preset.xml/v<NEW_HASH>/).
     git_version = None
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     try:
-        # Get the script's directory to find git repo
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        result = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], 
-                              cwd=script_dir, 
-                              capture_output=True, 
-                              text=True, 
+        result = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'],
+                              cwd=script_dir,
+                              capture_output=True,
+                              text=True,
                               timeout=5)
         if result.returncode == 0:
             git_version = result.stdout.strip()
-            logger.info(f'Git version: {git_version}')
+            logger.info(f'Git commit (script dir): v{git_version}  -> output will be under .../v{git_version}/')
     except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
         logger.debug(f'Could not get git version: {e}')
-    
-    # Validate and append version to output path if provided
+
+    # Append version to output path (rule: each conversion in a uniquely named folder)
     if args.Version:
-        # Allow "exception" as a special version name, otherwise validate as 3-digit number
         if args.Version != "exception" and (not args.Version.isdigit() or len(args.Version) != 3):
             logger.error(f'Version must be a 3-digit number (e.g., 001, 002) or "exception", got: {args.Version}')
             sys.exit(1)
         args.Output = os.path.join(args.Output, f'v{args.Version}')
+        logger.info(f'Output directory: {os.path.abspath(args.Output)}')
     elif git_version:
-        # Use git commit hash so output folder matches the code version
         args.Output = os.path.join(args.Output, f'v{git_version}')
-        logger.info(f'Using git commit hash: v{git_version}')
+        logger.info(f'Output directory: {os.path.abspath(args.Output)}')
+    else:
+        import uuid
+        run_id = uuid.uuid4().hex[:7]
+        args.Output = os.path.join(args.Output, f'v{run_id}')
+        logger.info(f'No git repo; run-unique id v{run_id}. Output directory: {os.path.abspath(args.Output)}')
     
     if args.verbose:
         logger.setLevel(logging.DEBUG)
