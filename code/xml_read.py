@@ -2277,6 +2277,27 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                 if clip_length_beats <= 1.0:
                     logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Using default clip length = 1.0 beat')
                     clip_length_beats = 1.0
+
+            # Extend short note durations: when notes visually fill the clip but XML has short durations,
+            # extend each note to reach the next note (or clip end). Only lengthen, never shorten.
+            if sublayer_events and clip_length_beats > 1.0:
+                min_dur_to_extend = min(1.0, clip_length_beats / max(1, len(sublayer_events)))  # Only extend if short
+                sorted_events = sorted(sublayer_events, key=lambda e: (e.get('time_val', 0), e.get('chan', '')))
+                for i, event in enumerate(sorted_events):
+                    time_val = event.get('time_val', 0)
+                    dur_val = event.get('dur_val', 0)
+                    if dur_val >= min_dur_to_extend:
+                        continue  # Already long enough, skip
+                    if i + 1 < len(sorted_events):
+                        next_start = sorted_events[i + 1].get('time_val', time_val + dur_val)
+                        # If next note starts at same time (chord/simultaneous), extend to clip end
+                        target_end = clip_length_beats if next_start <= time_val else next_start
+                    else:
+                        target_end = clip_length_beats
+                    target_dur = max(dur_val, target_end - time_val)
+                    if target_dur > dur_val and target_dur > 0:
+                        event['dur_val'] = target_dur
+                        logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Extended note at {time_val:.2f} from {dur_val:.2f} to {target_dur:.2f} beats')
             
             # Sanity cap only when clip_length came from CurrentEnd (unreliable - can be time in sec).
             # LoopStart/LoopEnd and note-derived lengths are trusted; allow up to 256 beats (64 bars).
@@ -2644,14 +2665,9 @@ def make_song(root):
 def make_song_from_sections(root, sections, pad_list, midi_tracks):
     """
     Create Blackbox song sections (layer 2 cells) from parsed locator/arrangement data.
-
-    sections: list of dicts:
-      {
-        'name': str,
-        'repeats': int,
-        'pad_conds': {pad_index: cond_int_0_1_2},
-        'seq_conds': {(seq_index, layer_index): cond_int_0_1_2}
-      }
+    Matches preset_expected_song.xml format:
+    - Pads (chan 0-15): from drum track pad_conds; silayer 1 when arrangement has seq layer B for that pad
+    - Seqs (chan 256+): from arrangement seq_conds per (seq_idx, silayer) with cond 0/1/2
     """
     session = root.find('session')
     if session is None:
@@ -2662,23 +2678,54 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
     num_seqs = min(16, len(midi_tracks))
 
     for row_idx, sec in enumerate(sections):
-        # SWAP: We extract "pad_conds" from drum track (which pad has notes) and "seq_conds" from
-        # sequence tracks (which seq overlaps section). Blackbox section XML uses chan 0-15 for
-        # PAD conditions and chan 256+ for SEQ conditions. We had them backwards: write
-        # extracted seq_conds (which sequence plays) -> pad events (chan 0-15), and
-        # extracted pad_conds (which pad from drum) -> seq events (chan 256+).
-        extracted_pad_conds = dict(sec.get('pad_conds', {}) or {})   # from drum track
-        extracted_seq_conds = dict(sec.get('seq_conds', {}) or {})   # from seq tracks
-        # XML pad events (chan 0-15): use extracted SEQ data (which sequence is on)
-        pad_conds_for_xml = {}
+        extracted_pad_conds = dict(sec.get('pad_conds', {}) or {})   # from drum: which pad has notes/Keep
+        extracted_seq_conds = dict(sec.get('seq_conds', {}) or {})   # from arrangement: which seq has clips
+
+        # Arrangement-only ON (before drum merge) - for pad events we only want arr-derived pads
+        arr_only_on = {pad_idx for pad_idx in range(num_seqs)
+                       if any(extracted_seq_conds.get((pad_idx, li), 0) == 1 for li in range(4))}
+
+        # Expected format: drum pad state → seq events (pad 4 playing = seq 3 ON, Keep 4 = seq 3 Keep)
+        # Merge drum into seq_conds for layer 0 so drum state appears as seq events, not pad events
+        for pad_idx in range(num_seqs):
+            drum_cond = int(extracted_pad_conds.get(pad_idx, 0))
+            if drum_cond > 0:
+                arr_cond = extracted_seq_conds.get((pad_idx, 0), 0)
+                extracted_seq_conds[(pad_idx, 0)] = max(arr_cond, drum_cond)
+
+        # Pre-compute layer B inference: pads that get seq Keep from column sharing (not from arrangement)
+        _seq_conds_preview = dict(extracted_seq_conds)
+        layer_b_seqs = {si for si in range(num_seqs) if _seq_conds_preview.get((si, 1), 0) == 1}
+        for seq_index in layer_b_seqs:
+            _, col = row_column(seq_index)
+            for si in range(num_seqs):
+                r, c = row_column(si)
+                if c == col and r >= 1:
+                    _seq_conds_preview[(si, 0)] = max(_seq_conds_preview.get((si, 0), 0), 2)
+            _seq_conds_preview[(seq_index, 0)] = max(_seq_conds_preview.get((seq_index, 0), 0), 2)
+        # Pads that get seq Keep from inference only (arrangement didn't have Keep) = seq-only Keep
+        seq_only_keep_pads = set()
+        for pad_idx in range(num_seqs):
+            arr_had_keep = any(extracted_seq_conds.get((pad_idx, li), 0) == 2 for li in range(4))
+            infers_keep = _seq_conds_preview.get((pad_idx, 0), 0) == 2
+            if infers_keep and not arr_had_keep:
+                seq_only_keep_pads.add(pad_idx)
+
+        # Pads: from arrangement ON only (arr_only_on). Drum pad state goes to seq events (see merge above).
+        # Don't output pad for seq-only Keep (layer B column).
+        pad_events = []
         for pad_idx in range(num_pads):
-            cond = max(int(extracted_seq_conds.get((pad_idx, layer_idx), 0)) for layer_idx in range(4))
-            pad_conds_for_xml[pad_idx] = cond
-        # XML seq events (chan 256+, silayer 0-3): use extracted PAD data (which pad from drum)
-        seq_conds_for_xml = {}
-        for seq_index in range(num_seqs):
-            for layer_idx in range(4):
-                seq_conds_for_xml[(seq_index, layer_idx)] = int(extracted_pad_conds.get(seq_index, 0))
+            drum_cond = int(extracted_pad_conds.get(pad_idx, 0))
+            arr_on = 1 if pad_idx in arr_only_on else 0
+            # Drum state → seq; only arrangement ON as pad. Suppress pad when drum-only (no arr) or seq-only Keep
+            if drum_cond > 0 and arr_on == 0:
+                cond = 0  # Drum plays/Keep: output as seq only, not pad
+            elif drum_cond == 2 and pad_idx in seq_only_keep_pads:
+                cond = 0  # Seq Keep only
+            else:
+                cond = arr_on
+            silayer = 1 if extracted_seq_conds.get((pad_idx, 1), 0) == 1 else 0
+            pad_events.append((pad_idx, silayer, cond))
 
         cell = ET.SubElement(session, 'cell')
         cell.attrib = {
@@ -2695,22 +2742,37 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
 
         sequence = ET.SubElement(cell, 'sequence')
 
-        # Pads: chan 0–15, silayer 0 (from extracted seq_conds: which sequence plays)
-        for pad_idx in range(num_pads):
-            cond = int(pad_conds_for_xml.get(pad_idx, 0))
-            ET.SubElement(sequence, 'seqevent', attrib={
-                'step': '0',
-                'chan': str(pad_idx),
-                'type': 'sceneitem',
-                'silayer': '0',
-                'cond': str(cond),
-            })
+        # Pads: chan 0 first without chan attr (per expected), then 1-15
+        for pad_idx, silayer, cond in pad_events:
+            attrs = {'step': '0', 'type': 'sceneitem', 'silayer': str(silayer), 'cond': str(cond)}
+            if pad_idx != 0:
+                attrs['chan'] = str(pad_idx)
+            ET.SubElement(sequence, 'seqevent', attrib=attrs)
 
-        # Sequences: chan 256–271, silayer 0–3 (from extracted pad_conds: which pad from drum)
+        # Sequences: from arrangement seq_conds
+        # When seq N has layer B: Keep (2) on silayer 0 for column; pad carries layer
+        # Only output seq cond 1 when single seq has clip; when multiple pads, pads carry it (seq=0)
+        _seq_conds = dict(extracted_seq_conds)
+        layer_b_seqs = {si for si in range(num_seqs) if _seq_conds.get((si, 1), 0) == 1}
+        for seq_index in layer_b_seqs:
+            _, col = row_column(seq_index)
+            for si in range(num_seqs):
+                r, c = row_column(si)
+                if c == col and r >= 1:
+                    _seq_conds[(si, 0)] = max(_seq_conds.get((si, 0), 0), 2)
+            _seq_conds[(seq_index, 0)] = max(_seq_conds.get((seq_index, 0), 0), 2)
+            _seq_conds[(seq_index, 1)] = 0
+        # When multiple seqs have any cond (1 or 2), clear cond 1 - pads carry; only Keep (2) stays
+        seqs_with_clip = {si for si in range(num_seqs) for li in range(4) if _seq_conds.get((si, li), 0) >= 1}
+        if len(seqs_with_clip) > 1:
+            for si in seqs_with_clip:
+                for li in range(4):
+                    if _seq_conds.get((si, li), 0) == 1:
+                        _seq_conds[(si, li)] = 0
         for seq_index in range(num_seqs):
             chan_val = 256 + seq_index
             for layer_idx in range(4):
-                cond = int(seq_conds_for_xml.get((seq_index, layer_idx), 0))
+                cond = int(_seq_conds.get((seq_index, layer_idx), 0))
                 ET.SubElement(sequence, 'seqevent', attrib={
                     'step': '0',
                     'chan': str(chan_val),
@@ -3025,23 +3087,31 @@ def extract_pad_sections(tracks, pad_list, locators, tolerance_beats=0.1):
         except (ValueError, TypeError):
             continue
 
-        # Find matching locator (by time within tolerance)
-        section_index = None
-        for idx, loc in enumerate(locators):
-            if abs(loc['time'] - start_time) <= tolerance_beats:
-                section_index = idx
-                break
-        if section_index is None:
-            continue
+        # Clip end for overlap detection
+        end_time = None
+        current_end = find_element_by_tag(clip, 'CurrentEnd')
+        if current_end is not None and 'Value' in current_end.attrib:
+            try:
+                end_time = float(current_end.attrib['Value'])
+            except (ValueError, TypeError):
+                pass
+        if end_time is None or end_time <= start_time:
+            loop_start = find_element_by_tag(clip, 'LoopStart')
+            loop_end = find_element_by_tag(clip, 'LoopEnd')
+            if loop_start is not None and 'Value' in loop_start.attrib and loop_end is not None and 'Value' in loop_end.attrib:
+                try:
+                    end_time = start_time + (float(loop_end.attrib['Value']) - float(loop_start.attrib['Value']))
+                except (ValueError, TypeError):
+                    pass
+        if end_time is None or end_time <= start_time:
+            end_time = start_time + 4.0
 
         name_el = find_element_by_tag(clip, 'Name')
         clip_name = name_el.attrib.get('Value', '') if name_el is not None else ''
         keep_pads = parse_keep_pads_from_name(clip_name)
 
-        section_data = pad_sections[section_index]
-        section_data['pads_keep'].update(keep_pads)
-
         # Extract MIDI notes (one or more) and map to pads
+        pads_from_clip = set()
         notes_elem = find_element_by_tag(clip, 'Notes')
         if notes_elem is not None:
             key_tracks = find_element_by_tag(notes_elem, 'KeyTracks')
@@ -3057,7 +3127,16 @@ def extract_pad_sections(tracks, pad_list, locators, tolerance_beats=0.1):
                         continue
                     pad_index = midi_to_pad.get(midi_note)
                     if pad_index is not None:
-                        section_data['pads_on'].add(pad_index)
+                        pads_from_clip.add(pad_index)
+
+        # Apply to all sections this clip OVERLAPS (like seq_sections)
+        for idx in range(len(locators)):
+            sec_start = locators[idx]['time']
+            sec_end = locators[idx + 1]['time'] if idx + 1 < len(locators) else (end_time + 1.0)
+            if start_time < sec_end and end_time > sec_start:
+                section_data = pad_sections[idx]
+                section_data['pads_keep'].update(keep_pads)
+                section_data['pads_on'].update(pads_from_clip)
 
     # Convert sets into cond maps
     result = []
@@ -3163,12 +3242,32 @@ def extract_seq_sections(midi_tracks, locators, tolerance_beats=0.1):
                     continue
 
             # Clip overlaps section → seq ON for that section (e.g. Seq1 looped across locator borders)
+            # Prefer clips that START within the section (ignore carry-over from previous section).
+            # When multiple layers overlap, we keep the one with latest start_time per (section, seq).
             for idx in range(len(locators)):
                 sec_start = locators[idx]['time']
                 sec_end = locators[idx + 1]['time'] if idx + 1 < len(locators) else (end_time + 1.0)
                 if start_time < sec_end and end_time > sec_start:
-                    section_seq_data[idx]['seq_conds'][(seq_index, layer_idx)] = 1
+                    sec_map = section_seq_data[idx]['seq_conds']
+                    # Store (start_time, layer_idx) to resolve conflicts: prefer latest-starting clip
+                    if '__overlaps' not in sec_map:
+                        sec_map['__overlaps'] = {}  # (seq_index,) -> (start_time, layer_idx)
+                    key = seq_index
+                    if key not in sec_map['__overlaps'] or start_time >= sec_map['__overlaps'][key][0]:
+                        sec_map['__overlaps'][key] = (start_time, layer_idx)
+                    # Also set cond=1 for backward compat; we'll clear duplicates in post-pass
+                    sec_map[(seq_index, layer_idx)] = 1
                     logger.debug(f'  Seq {seq_index} layer {layer_idx} overlaps section {idx} ({sec_start:.1f}-{sec_end:.1f}) → ON')
+
+    # Resolve conflicts: when multiple explicit (A/B/C/D) clips overlap same section for same seq,
+    # keep only the one with latest clip start. Do NOT clear cond=2 (Keep) from other layers.
+    for sec in section_seq_data:
+        sec_map = sec['seq_conds']
+        overlaps = sec_map.pop('__overlaps', {})
+        for seq_index, (_, layer_idx) in overlaps.items():
+            for li in range(4):
+                if li != layer_idx and sec_map.get((seq_index, li)) == 1:
+                    sec_map[(seq_index, li)] = 0  # Clear only other explicit-ON layers, preserve Keep (2)
 
     return section_seq_data
 
@@ -3228,7 +3327,7 @@ def save_xml(root, preset_filepath):
 
 
 def _section_content_from_root(root):
-    """Extract list of section dicts: name, repeats, pad_conds {pad_idx: cond}, seq_conds {(seq_idx, silayer): cond}."""
+    """Extract list of section dicts: name, repeats, pad_conds {(pad_idx, silayer): cond}, seq_conds {(seq_idx, silayer): cond}."""
     session = root.find('session')
     if session is None:
         return []
@@ -3247,18 +3346,18 @@ def _section_content_from_root(root):
                 if ev.get('type') != 'sceneitem':
                     continue
                 chan = ev.get('chan')
-                silayer = ev.get('silayer', '0')
+                silayer = int(ev.get('silayer', '0') or 0)
                 cond = int(ev.get('cond', 0))
-                if chan is None:
-                    continue
-                try:
-                    c = int(chan)
-                except ValueError:
-                    continue
+                c = 0 if chan is None else None
+                if c is None:
+                    try:
+                        c = int(chan)
+                    except (ValueError, TypeError):
+                        continue
                 if 0 <= c <= 15:
-                    pad_conds[c] = cond
+                    pad_conds[(c, silayer)] = cond
                 elif 256 <= c <= 271:
-                    seq_conds[(c - 256, int(silayer) if silayer else 0)] = cond
+                    seq_conds[(c - 256, silayer)] = cond
         out.append({'name': name, 'repeats': repeats, 'pad_conds': pad_conds, 'seq_conds': seq_conds})
     return out
 
@@ -3291,10 +3390,11 @@ def compare_section_content(expected_preset_path, actual_preset_path, max_sectio
         a = act_sec[i]
         name_ok = e['name'] == a['name']
         rep_ok = e['repeats'] == a['repeats']
-        pad_on_exp = {p for p, c in e['pad_conds'].items() if c == 1}
-        pad_on_act = {p for p, c in a['pad_conds'].items() if c == 1}
-        seq_on_exp = {k for k, c in e['seq_conds'].items() if c == 1}
-        seq_on_act = {k for k, c in a['seq_conds'].items() if c == 1}
+        # pad_conds: (pad_idx, silayer) -> cond; pad "on" = any cond>=1
+        pad_on_exp = {k for k, c in e['pad_conds'].items() if c >= 1}
+        pad_on_act = {k for k, c in a['pad_conds'].items() if c >= 1}
+        seq_on_exp = {k for k, c in e['seq_conds'].items() if c >= 1}
+        seq_on_act = {k for k, c in a['seq_conds'].items() if c >= 1}
         pad_ok = pad_on_exp == pad_on_act
         seq_ok = seq_on_exp == seq_on_act
         if not (name_ok and rep_ok and pad_ok and seq_ok):
