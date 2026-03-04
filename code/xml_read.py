@@ -1275,8 +1275,12 @@ def track_iterator(tracks):
         if not skipped_drum:
             skipped_drum = True
             continue
+        # Ableton stores track name in Name/EffectiveName or Name/UserName (Live 12+)
         name_elem = find_element_by_tag(track, 'Name')
-        track_name = name_elem.attrib.get('Value', '') if name_elem is not None else ''
+        track_name = ''
+        if name_elem is not None:
+            effective = find_element_by_tag(name_elem, 'EffectiveName') or find_element_by_tag(name_elem, 'UserName')
+            track_name = (effective.attrib.get('Value', '') or '') if effective is not None else (name_elem.attrib.get('Value', '') or '')
         midi_tracks.append(track)
         midi_track_info.append((track, track_name, len(midi_tracks) - 1))
         logger.info(f'  Found MIDI track (name="{track_name}") for sequence (midi_tracks index {len(midi_tracks)-1})')
@@ -2693,35 +2697,19 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
                 arr_cond = extracted_seq_conds.get((pad_idx, 0), 0)
                 extracted_seq_conds[(pad_idx, 0)] = max(arr_cond, drum_cond)
 
-        # Pre-compute layer B inference: pads that get seq Keep from column sharing (not from arrangement)
-        _seq_conds_preview = dict(extracted_seq_conds)
-        layer_b_seqs = {si for si in range(num_seqs) if _seq_conds_preview.get((si, 1), 0) == 1}
-        for seq_index in layer_b_seqs:
-            _, col = row_column(seq_index)
-            for si in range(num_seqs):
-                r, c = row_column(si)
-                if c == col and r >= 1:
-                    _seq_conds_preview[(si, 0)] = max(_seq_conds_preview.get((si, 0), 0), 2)
-            _seq_conds_preview[(seq_index, 0)] = max(_seq_conds_preview.get((seq_index, 0), 0), 2)
-        # Pads that get seq Keep from inference only (arrangement didn't have Keep) = seq-only Keep
-        seq_only_keep_pads = set()
-        for pad_idx in range(num_seqs):
-            arr_had_keep = any(extracted_seq_conds.get((pad_idx, li), 0) == 2 for li in range(4))
-            infers_keep = _seq_conds_preview.get((pad_idx, 0), 0) == 2
-            if infers_keep and not arr_had_keep:
-                seq_only_keep_pads.add(pad_idx)
+        # Keep comes only from explicit sources:
+        # - Pads: drum clip name "Keep 7, 15, 11" (merged to seq layer 0 above)
+        # - Seqs: empty arrangement clip named "Keep" on that seq track
+        # No layer B column sharing – no inferred Keeps.
 
         # Pads: from arrangement ON only (arr_only_on). Drum pad state goes to seq events (see merge above).
-        # Don't output pad for seq-only Keep (layer B column).
         pad_events = []
         for pad_idx in range(num_pads):
             drum_cond = int(extracted_pad_conds.get(pad_idx, 0))
             arr_on = 1 if pad_idx in arr_only_on else 0
-            # Drum state → seq; only arrangement ON as pad. Suppress pad when drum-only (no arr) or seq-only Keep
+            # Drum state → seq; only arrangement ON as pad. Suppress pad when drum-only (no arr)
             if drum_cond > 0 and arr_on == 0:
                 cond = 0  # Drum plays/Keep: output as seq only, not pad
-            elif drum_cond == 2 and pad_idx in seq_only_keep_pads:
-                cond = 0  # Seq Keep only
             else:
                 cond = arr_on
             silayer = 1 if extracted_seq_conds.get((pad_idx, 1), 0) == 1 else 0
@@ -2750,18 +2738,13 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
             ET.SubElement(sequence, 'seqevent', attrib=attrs)
 
         # Sequences: from arrangement seq_conds
-        # When seq N has layer B: Keep (2) on silayer 0 for column; pad carries layer
+        # When seq N has layer B: clear layer B from seq output (pad carries layer).
+        # Keep only from explicit drum clip or seq "Keep" clip – no inferred Keeps.
         # Only output seq cond 1 when single seq has clip; when multiple pads, pads carry it (seq=0)
         _seq_conds = dict(extracted_seq_conds)
         layer_b_seqs = {si for si in range(num_seqs) if _seq_conds.get((si, 1), 0) == 1}
         for seq_index in layer_b_seqs:
-            _, col = row_column(seq_index)
-            for si in range(num_seqs):
-                r, c = row_column(si)
-                if c == col and r >= 1:
-                    _seq_conds[(si, 0)] = max(_seq_conds.get((si, 0), 0), 2)
-            _seq_conds[(seq_index, 0)] = max(_seq_conds.get((seq_index, 0), 0), 2)
-            _seq_conds[(seq_index, 1)] = 0
+            _seq_conds[(seq_index, 1)] = 0  # Pad carries layer B; seq outputs layer A only
         # When multiple seqs have any cond (1 or 2), clear cond 1 - pads carry; only Keep (2) stays
         seqs_with_clip = {si for si in range(num_seqs) for li in range(4) if _seq_conds.get((si, li), 0) >= 1}
         if len(seqs_with_clip) > 1:
@@ -3087,7 +3070,7 @@ def extract_pad_sections(tracks, pad_list, locators, tolerance_beats=0.1):
         except (ValueError, TypeError):
             continue
 
-        # Clip end for overlap detection
+        # Clip end for section-boundary detection
         end_time = None
         current_end = find_element_by_tag(clip, 'CurrentEnd')
         if current_end is not None and 'Value' in current_end.attrib:
@@ -3154,10 +3137,27 @@ def extract_pad_sections(tracks, pad_list, locators, tolerance_beats=0.1):
     return result
 
 
-def extract_seq_sections(midi_tracks, locators, tolerance_beats=0.1):
+def _seq_index_from_track(track, enum_index, midi_track_info=None):
+    """
+    Resolve seq index for a track. Use track name (e.g. 'Seq13' → 12) when available,
+    otherwise use enumeration order. Ensures Ableton 'Seq9' always maps to Blackbox seq 9.
+    """
+    if midi_track_info and enum_index < len(midi_track_info):
+        _, track_name, _ = midi_track_info[enum_index]
+        if track_name:
+            m = re.match(r'[Ss]eq\s*(\d+)', track_name.strip())
+            if m:
+                n = int(m.group(1))
+                if 1 <= n <= 16:
+                    return n - 1
+    return enum_index
+
+
+def extract_seq_sections(midi_tracks, locators, midi_track_info=None, tolerance_beats=0.1):
     """
     For each locator, determine per-sequence, per-layer conditions
     (on/off/keep) from the sequence tracks' arrangement clips.
+    Uses track name (e.g. Seq13) for seq index when available, so clip on 'Seq13' → seq 12.
     """
     if not midi_tracks or not locators:
         return [{'seq_conds': {}} for _ in locators]
@@ -3166,7 +3166,8 @@ def extract_seq_sections(midi_tracks, locators, tolerance_beats=0.1):
     for _ in locators:
         section_seq_data.append({'seq_conds': {}})
 
-    for seq_index, track in enumerate(midi_tracks[:16]):
+    for enum_index, track in enumerate(midi_tracks[:16]):
+        seq_index = _seq_index_from_track(track, enum_index, midi_track_info)
         device_chain = find_element_by_tag(track, 'DeviceChain')
         if not device_chain:
             continue
@@ -3231,40 +3232,39 @@ def extract_seq_sections(midi_tracks, locators, tolerance_beats=0.1):
                 if kind == 'layer':
                     layer_idx = value
                 elif kind == 'keep':
-                    # KEEP: set for every section this clip overlaps
+                    # KEEP: empty clip named "Keep" on seq N → keep seq N for each section it spans.
+                    # Only silayer 0 (one Keep per seq).
                     for idx in range(len(locators)):
                         sec_start = locators[idx]['time']
                         sec_end = locators[idx + 1]['time'] if idx + 1 < len(locators) else (end_time + 1.0)
                         if start_time < sec_end and end_time > sec_start:
                             sec_map = section_seq_data[idx]['seq_conds']
-                            for li in range(4):
-                                sec_map[(seq_index, li)] = 2
+                            sec_map[(seq_index, 0)] = 2
                     continue
 
-            # Clip overlaps section → seq ON for that section (e.g. Seq1 looped across locator borders)
-            # Prefer clips that START within the section (ignore carry-over from previous section).
-            # When multiple layers overlap, we keep the one with latest start_time per (section, seq).
+            # Count clips that START within the section (clip triggered in this section).
+            # Only attribute to section where clip starts (clip triggered in this section).
             for idx in range(len(locators)):
                 sec_start = locators[idx]['time']
                 sec_end = locators[idx + 1]['time'] if idx + 1 < len(locators) else (end_time + 1.0)
-                if start_time < sec_end and end_time > sec_start:
+                if sec_start <= start_time < sec_end:
                     sec_map = section_seq_data[idx]['seq_conds']
                     # Store (start_time, layer_idx) to resolve conflicts: prefer latest-starting clip
-                    if '__overlaps' not in sec_map:
-                        sec_map['__overlaps'] = {}  # (seq_index,) -> (start_time, layer_idx)
+                    if '__clip_starts' not in sec_map:
+                        sec_map['__clip_starts'] = {}  # (seq_index,) -> (start_time, layer_idx)
                     key = seq_index
-                    if key not in sec_map['__overlaps'] or start_time >= sec_map['__overlaps'][key][0]:
-                        sec_map['__overlaps'][key] = (start_time, layer_idx)
-                    # Also set cond=1 for backward compat; we'll clear duplicates in post-pass
+                    if key not in sec_map['__clip_starts'] or start_time >= sec_map['__clip_starts'][key][0]:
+                        sec_map['__clip_starts'][key] = (start_time, layer_idx)
+                    # Also set cond=1; we'll clear duplicates in post-pass
                     sec_map[(seq_index, layer_idx)] = 1
-                    logger.debug(f'  Seq {seq_index} layer {layer_idx} overlaps section {idx} ({sec_start:.1f}-{sec_end:.1f}) → ON')
+                    logger.debug(f'  Seq {seq_index} layer {layer_idx} starts in section {idx} ({sec_start:.1f}-{sec_end:.1f}) → ON')
 
-    # Resolve conflicts: when multiple explicit (A/B/C/D) clips overlap same section for same seq,
+    # Resolve conflicts: when multiple explicit (A/B/C/D) clips for same seq start in same section,
     # keep only the one with latest clip start. Do NOT clear cond=2 (Keep) from other layers.
     for sec in section_seq_data:
         sec_map = sec['seq_conds']
-        overlaps = sec_map.pop('__overlaps', {})
-        for seq_index, (_, layer_idx) in overlaps.items():
+        clip_starts = sec_map.pop('__clip_starts', {})
+        for seq_index, (_, layer_idx) in clip_starts.items():
             for li in range(4):
                 if li != layer_idx and sec_map.get((seq_index, li)) == 1:
                     sec_map[(seq_index, li)] = 0  # Clear only other explicit-ON layers, preserve Keep (2)
@@ -3272,7 +3272,7 @@ def extract_seq_sections(midi_tracks, locators, tolerance_beats=0.1):
     return section_seq_data
 
 
-def build_song_sections(root, tracks, pad_list, midi_tracks, tolerance_beats=0.1):
+def build_song_sections(root, tracks, pad_list, midi_tracks, midi_track_info=None, tolerance_beats=0.1):
     """
     High-level helper to build song-section data structure from locators
     and arrangement clips.
@@ -3282,7 +3282,7 @@ def build_song_sections(root, tracks, pad_list, midi_tracks, tolerance_beats=0.1
         return []
 
     pad_sections = extract_pad_sections(tracks, pad_list, locators, tolerance_beats=tolerance_beats)
-    seq_sections = extract_seq_sections(midi_tracks, locators, tolerance_beats=tolerance_beats)
+    seq_sections = extract_seq_sections(midi_tracks, locators, midi_track_info=midi_track_info, tolerance_beats=tolerance_beats)
 
     sections = []
     for idx, loc in enumerate(locators):
@@ -3444,7 +3444,7 @@ def main(args):
         song_sections = []
         if getattr(args, 'song_mode', False):
             logger.info('Song mode enabled – extracting locators and arrangement data')
-            song_sections = build_song_sections(root, tracks, pad_list, midi_tracks, tolerance_beats=0.1)
+            song_sections = build_song_sections(root, tracks, pad_list, midi_tracks, midi_track_info=midi_track_info, tolerance_beats=0.1)
             if not song_sections:
                 logger.warning('Song mode requested but no valid locators found; falling back to default empty sections')
         
