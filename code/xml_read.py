@@ -2724,17 +2724,14 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
         # - Seqs: empty arrangement clip named "Keep" on that seq track
         # No layer B column sharing – no inferred Keeps.
 
-        # Pads: from arrangement ON only (arr_only_on). Drum pad state goes to seq events (see merge above).
-        # Pad cond can also be Keep (2) from Pads track "Keep N" when that pad has arr clip.
+        # Pads: show Pads-track state (ON/Keep) and arrangement-derived ON.
+        # Pads track "Keep 7,11,15" or clip with notes → pad_conds; must show on pad (was broken by suppressing when arr_on=0).
         pad_events = []
         for pad_idx in range(num_pads):
             drum_cond = int(extracted_pad_conds.get(pad_idx, 0))
             arr_on = 1 if pad_idx in arr_only_on else 0
-            # Drum state → seq; only arrangement ON as pad. Suppress pad when drum-only (no arr)
-            if drum_cond > 0 and arr_on == 0:
-                cond = 0  # Drum plays/Keep: output as seq only, not pad
-            else:
-                cond = arr_on if arr_on else max(0, min(2, drum_cond))
+            # Prefer arr ON (1); else use Pads-track state (Keep=2 or ON=1) so Intro pad 4 ON, Keep 7/11/15 etc. show
+            cond = 1 if arr_on else (drum_cond if drum_cond else 0)
             silayer = 1 if extracted_seq_conds.get((pad_idx, 1), 0) == 1 else 0
             pad_events.append((pad_idx, silayer, cond))
 
@@ -3192,16 +3189,16 @@ def extract_pad_sections(tracks, pad_list, locators, tolerance_beats=0.1):
             if starts_here:
                 pad_sections[idx]['pads_on'].update(pads_from_clip)
 
-    # Convert sets into cond maps
+    # Convert sets into cond maps. Prefer ON over Keep when clip starts in this section (so 0 Intro = pad 4 playing, 0 intro build = pad 4 Keep).
     result = []
     num_pads = len(pad_list)
     for sec in pad_sections:
         conds = {}
         for pad_idx in range(num_pads):
-            if pad_idx in sec['pads_keep']:
-                conds[pad_idx] = 2  # Keep
-            elif pad_idx in sec['pads_on']:
-                conds[pad_idx] = 1  # On
+            if pad_idx in sec['pads_on']:
+                conds[pad_idx] = 1  # On (clip starts here)
+            elif pad_idx in sec['pads_keep']:
+                conds[pad_idx] = 2  # Keep (clip overlaps)
             else:
                 conds[pad_idx] = 0  # Off
         result.append({'pad_conds': conds})
