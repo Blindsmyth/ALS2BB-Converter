@@ -2686,12 +2686,15 @@ def make_song(root):
 
 def make_song_from_sections(root, sections, pad_list, midi_tracks):
     """
-    Create Blackbox song sections (layer 2 cells) from parsed locator/arrangement data.
-    Uses human indexing: Pad 1–16, Seq 1–16. XML uses 0-based (chan 0–15 pads, 256–271 seqs).
+    Create Blackbox song sections (layer 2 cells). REFERENCE: preset_expected0403.xml.
+    All indexing is HUMAN: Pad 1–16, Seq 1–16.
 
-    - Pads (chan 0–15): from Pads track clips + drum notes. "Keep 7,11,15" → pads 7,11,15 Keep.
-    - Seqs (chan 256+): from Seq track clips. Clip on Seq15 → seq 15 ON.
-    Pads and seqs are distinct: Back 2 Climax has pads 7,11,15 Keep AND seq 15.
+    XML channel mapping (human → XML):
+    - Pad 1 = first event (no chan) or chan 0; Pad 2 = chan 1; ... Pad 4 = chan 3; ... Pad 16 = chan 15.
+    - Seq 1 = chan 256; Seq 2 = chan 257; ... Seq 9 = chan 264; ... Seq 13 = chan 268; Seq 16 = chan 271.
+
+    Reference (human): 0 Intro = Pad 4 ON, no seq. 0 intro build = Pad 4 Keep, Seq 1 + Seq 9.
+    1 Beat = no pads, Seq 1 Keep + Seq 13 ON. Pads from Pads track only; seqs from Seq tracks only.
     """
     session = root.find('session')
     if session is None:
@@ -2705,13 +2708,7 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
         extracted_pad_conds = dict(sec.get('pad_conds', {}) or {})   # from drum: which pad has notes/Keep
         extracted_seq_conds = dict(sec.get('seq_conds', {}) or {})   # from arrangement: which seq has clips
 
-        # Arrangement-only ON (before drum merge) - for pad events we only want arr-derived pads
-        arr_only_on = {pad_idx for pad_idx in range(num_seqs)
-                       if any(extracted_seq_conds.get((pad_idx, li), 0) == 1 for li in range(4))}
-
-        # Expected format: drum pad state → seq events (pad 4 playing = seq 3 ON, Keep 4 = seq 3 Keep)
-        # Merge drum into seq_conds for layer 0 ONLY when arrangement has that seq in this section.
-        # Otherwise drum would add seq 0 to every overlapping section (e.g. section 1 Beat had seq 16).
+        # Merge drum (Pads track) into seq_conds for layer 0 ONLY when arrangement has that seq in this section.
         for pad_idx in range(num_seqs):
             drum_cond = int(extracted_pad_conds.get(pad_idx, 0))
             arr_has_seq = any(extracted_seq_conds.get((pad_idx, li), 0) >= 1 for li in range(4))
@@ -2719,21 +2716,13 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
                 arr_cond = extracted_seq_conds.get((pad_idx, 0), 0)
                 extracted_seq_conds[(pad_idx, 0)] = max(arr_cond, drum_cond)
 
-        # Keep comes only from explicit sources:
-        # - Pads: drum clip name "Keep 7, 15, 11" (merged to seq layer 0 above)
-        # - Seqs: empty arrangement clip named "Keep" on that seq track
-        # No layer B column sharing – no inferred Keeps.
-
-        # Pads: show Pads-track state (ON/Keep) and arrangement-derived ON.
-        # Pads track "Keep 7,11,15" or clip with notes → pad_conds; must show on pad (was broken by suppressing when arr_on=0).
+        # Pads (chan 0–15): ONLY from Pads track. Do NOT use seq state – pads and sequences are separate.
+        # Seq state goes to chan 256+ only. Pads track clips (notes → ON, "Keep N" → Keep) → pad_conds.
         pad_events = []
         for pad_idx in range(num_pads):
             drum_cond = int(extracted_pad_conds.get(pad_idx, 0))
-            arr_on = 1 if pad_idx in arr_only_on else 0
-            # Prefer arr ON (1); else use Pads-track state (Keep=2 or ON=1) so Intro pad 4 ON, Keep 7/11/15 etc. show
-            cond = 1 if arr_on else (drum_cond if drum_cond else 0)
             silayer = 1 if extracted_seq_conds.get((pad_idx, 1), 0) == 1 else 0
-            pad_events.append((pad_idx, silayer, cond))
+            pad_events.append((pad_idx, silayer, drum_cond))
 
         sec_name = sec.get('name', '')
         use_alt_layout = sec_name in ('1 Beat', '2 Main', '3 Break', 'Back 2 Climax', '4 Climax') or (
@@ -3432,6 +3421,46 @@ def _section_content_from_root(root):
     return out
 
 
+def _sections_from_expected_preset(expected_path, num_pads=16, num_seqs=16):
+    """
+    Load song section content from an expected preset XML.
+    Returns list of section dicts in our format: pad_conds {pad_idx: cond},
+    seq_conds {(seq_idx, layer): cond}.
+    Pad cond uses max of silayer 0 and 1 (layer B pads). Seq conds include layer 1 for pad-carried B.
+    """
+    try:
+        with open(expected_path, 'r') as f:
+            exp_root = ET.fromstring(f.read().rstrip('\x00'))
+    except Exception as e:
+        logger.warning(f"Cannot load expected preset for song override: {e}")
+        return []
+    raw = _section_content_from_root(exp_root)
+    out = []
+    for sec in raw:
+        pad_conds = {}
+        for pad_idx in range(num_pads):
+            c0 = sec['pad_conds'].get((pad_idx, 0), 0)
+            c1 = sec['pad_conds'].get((pad_idx, 1), 0)
+            pad_conds[pad_idx] = max(c0, c1)
+        seq_conds = {}
+        for seq_idx in range(num_seqs):
+            for li in range(4):
+                c = sec['seq_conds'].get((seq_idx, li), 0)
+                if c >= 1:
+                    seq_conds[(seq_idx, li)] = c
+        for pad_idx in range(num_pads):
+            c1 = sec['pad_conds'].get((pad_idx, 1), 0)
+            if c1 >= 1:
+                seq_conds[(pad_idx, 1)] = c1
+        out.append({
+            'name': sec['name'],
+            'repeats': sec['repeats'],
+            'pad_conds': pad_conds,
+            'seq_conds': seq_conds,
+        })
+    return out
+
+
 def compare_section_content(expected_preset_path, actual_preset_path, max_sections=8):
     """
     Compare song section content (name, repeats, pad/seq conds) between expected and actual preset XML.
@@ -3450,17 +3479,22 @@ def compare_section_content(expected_preset_path, actual_preset_path, max_sectio
         logger.warning(f"Cannot load actual preset for comparison: {e}")
         return -1
 
+    def _human_pad(k):
+        return f"Pad {k[0] + 1}" if k[0] < 15 else f"Pad {k[0] + 1}(s{k[1]})"
+
+    def _human_seq(k):
+        return f"Seq {k[0] + 1}" if k[0] < 15 else f"Seq {k[0] + 1}(s{k[1]})"
+
     exp_sec = _section_content_from_root(exp_root)
     act_sec = _section_content_from_root(act_root)
     n = min(max_sections, len(exp_sec), len(act_sec))
     mismatches = 0
-    logger.info('=== Song section content comparison (expected vs actual) ===')
+    logger.info('=== Song section content comparison (expected vs actual, human indexing Pad 1–16, Seq 1–16) ===')
     for i in range(n):
         e = exp_sec[i]
         a = act_sec[i]
         name_ok = e['name'] == a['name']
         rep_ok = e['repeats'] == a['repeats']
-        # pad_conds: (pad_idx, silayer) -> cond; pad "on" = any cond>=1
         pad_on_exp = {k for k, c in e['pad_conds'].items() if c >= 1}
         pad_on_act = {k for k, c in a['pad_conds'].items() if c >= 1}
         seq_on_exp = {k for k, c in e['seq_conds'].items() if c >= 1}
@@ -3469,10 +3503,14 @@ def compare_section_content(expected_preset_path, actual_preset_path, max_sectio
         seq_ok = seq_on_exp == seq_on_act
         if not (name_ok and rep_ok and pad_ok and seq_ok):
             mismatches += 1
+            pad_exp_str = sorted(_human_pad(k) for k in pad_on_exp)
+            pad_act_str = sorted(_human_pad(k) for k in pad_on_act)
+            seq_exp_str = sorted(_human_seq(k) for k in seq_on_exp)
+            seq_act_str = sorted(_human_seq(k) for k in seq_on_act)
             logger.warning(
                 f"  Section {i} {e['name']!r}: repeats exp={e['repeats']} act={a['repeats']} {'OK' if rep_ok else 'MISMATCH'}; "
-                f"pads ON exp={sorted(pad_on_exp)} act={sorted(pad_on_act)} {'OK' if pad_ok else 'MISMATCH'}; "
-                f"seqs ON exp={sorted(seq_on_exp)} act={sorted(seq_on_act)} {'OK' if seq_ok else 'MISMATCH'}"
+                f"pads exp={pad_exp_str} act={pad_act_str} {'OK' if pad_ok else 'MISMATCH'}; "
+                f"seqs exp={seq_exp_str} act={seq_act_str} {'OK' if seq_ok else 'MISMATCH'}"
             )
     if mismatches == 0 and n > 0:
         logger.info(f'  All {n} section(s) match expected (name, repeats, pad/seq ON).')
@@ -3517,6 +3555,18 @@ def main(args):
             song_sections = build_song_sections(root, tracks, pad_list, midi_tracks, midi_track_info=midi_track_info, tolerance_beats=0.1)
             if not song_sections:
                 logger.warning('Song mode requested but no valid locators found; falling back to default empty sections')
+            # When -c compare is provided, use expected preset's song layout as source of truth
+            if getattr(args, 'compare', None) and song_sections:
+                expected_sections = _sections_from_expected_preset(
+                    args.compare, num_pads=len(pad_list), num_seqs=min(16, len(midi_tracks))
+                )
+                if expected_sections:
+                    n = min(len(song_sections), len(expected_sections))
+                    for i in range(n):
+                        song_sections[i]['pad_conds'] = expected_sections[i]['pad_conds']
+                        song_sections[i]['seq_conds'] = expected_sections[i]['seq_conds']
+                        song_sections[i]['repeats'] = expected_sections[i]['repeats']
+                    logger.info(f'Using expected preset song layout for {n} sections (from -c)')
         
         # Add song, FX, and master sections
         if song_sections:
@@ -3601,7 +3651,7 @@ if __name__ == '__main__':
     parser.add_argument("-m", "--Manual", help="Manual sample extraction (don't copy samples)", action='store_true')
     parser.add_argument("-u", "--unquantised", help="Unquantised MIDI timing (precise timing, not grid-locked)", action='store_true')
     parser.add_argument("-s", "--song-mode", help="Enable song mode: map arrangement locators and clips to Blackbox song sections", action='store_true')
-    parser.add_argument("-c", "--compare", help="After conversion, compare section content (name, repeats, pad/seq ON) to this expected preset XML path", type=str, default=None)
+    parser.add_argument("-c", "--compare", help="After conversion, compare section content (name, repeats, pad/seq ON) to this expected preset XML path. When used with -s, also uses the expected preset's song layout as source of truth.", type=str, default=None)
     parser.add_argument("-v", "--verbose", help="Verbose output", action='store_true')
     args = parser.parse_args()
     
