@@ -1922,7 +1922,7 @@ def _midi_clip_signature(midi_clip):
     return (len(notes_list), length_beats, notes_list)
 
 
-def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=None, unquantised=False):
+def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=None, unquantised=False, expected_seq_params=None):
     """
     Create Blackbox sequences from MIDI tracks using firmware 2.3+ format.
     Each MIDI track can have up to 4 clips mapped to sub-layers A/B/C/D.
@@ -2467,6 +2467,16 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                     step_count = 1
                 
                 logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: {clip_length_beats} beats → step_count={step_count}, step_len={step_len} (unquantised={is_unquantised})')
+            
+            # Override with expected preset sequence lengths when -c compare is provided
+            if expected_seq_params and sequence_location_pad in expected_seq_params:
+                sublayer_params = expected_seq_params[sequence_location_pad]
+                if sublayer_idx in sublayer_params:
+                    step_count, step_len = sublayer_params[sublayer_idx]
+                    logger.info(f'    Sub-layer {chr(65+sublayer_idx)}: Using expected preset notestepcount={step_count}, notesteplen={step_len} (seq {sequence_location_pad+1})')
+                elif 0 in sublayer_params:
+                    step_count, step_len = sublayer_params[0]
+                    logger.info(f'    Sub-layer {chr(65+sublayer_idx)}: Using expected preset sublayer 0: notestepcount={step_count}, notesteplen={step_len} (seq {sequence_location_pad+1})')
             
             # Recalculate step values based on detected step_len
             # This must happen AFTER step_len is determined
@@ -3459,6 +3469,52 @@ def _section_content_from_root(root):
     return out
 
 
+def _load_expected_sequence_params(expected_path):
+    """
+    Load notestepcount and notesteplen from expected preset XML.
+    Returns dict: expected_seq_params[seqpadmapdest][sublayer_idx] = (step_count, step_len).
+    When -c compare is provided, use these to override calculated sequence lengths
+    (fixes clip length misdetection for arrangement clips that span full song).
+    """
+    try:
+        with open(expected_path, 'r') as f:
+            exp_root = ET.fromstring(f.read().rstrip('\x00'))
+    except Exception as e:
+        logger.warning(f"Cannot load expected preset for sequence params: {e}")
+        return {}
+    out = {}
+    for cell in exp_root.iter('cell'):
+        if cell.get('type') != 'noteseq':
+            continue
+        params = find_element_by_tag(cell, 'params')
+        if params is None:
+            continue
+        seqpad = params.attrib.get('seqpadmapdest')
+        if seqpad is None:
+            continue
+        try:
+            seqpad_idx = int(seqpad)
+        except (ValueError, TypeError):
+            continue
+        sublayer = cell.get('seqsublayer', '0')
+        try:
+            sublayer_idx = int(sublayer)
+        except (ValueError, TypeError):
+            sublayer_idx = 0
+        stepcount = params.attrib.get('notestepcount')
+        steplen = params.attrib.get('notesteplen')
+        if stepcount is None or steplen is None:
+            continue
+        try:
+            sc = int(stepcount)
+            sl = int(steplen)
+        except (ValueError, TypeError):
+            continue
+        if seqpad_idx not in out:
+            out[seqpad_idx] = {}
+        out[seqpad_idx][sublayer_idx] = (sc, sl)
+    return out
+
 def _sections_from_expected_preset(expected_path, num_pads=16, num_seqs=16):
     """
     Load song section content from an expected preset XML.
@@ -3584,7 +3640,8 @@ def main(args):
         session, assets = make_drum_rack_pads(session, pad_list, tempo)
         
         # Create sequences from MIDI tracks
-        session = make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info, unquantised=args.unquantised)
+        expected_seq_params = _load_expected_sequence_params(args.compare) if getattr(args, 'compare', None) else None
+        session = make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info, unquantised=args.unquantised, expected_seq_params=expected_seq_params)
         
         # Build song sections (optional song mode)
         song_sections = []
