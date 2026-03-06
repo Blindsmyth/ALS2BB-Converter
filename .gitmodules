@@ -1,0 +1,3 @@
+[submodule "conversion_output"]
+	path = conversion_output
+	url = git@github.com:Blindsmyth/als2bb-output.git
