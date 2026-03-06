@@ -1883,13 +1883,16 @@ def _midi_clip_signature(midi_clip):
     if midi_clip is None:
         return None
     length_beats = 0.0
-    loop_start = find_element_by_tag(midi_clip, 'LoopStart')
-    loop_end = find_element_by_tag(midi_clip, 'LoopEnd')
-    if loop_start is not None and 'Value' in loop_start.attrib and loop_end is not None and 'Value' in loop_end.attrib:
-        try:
-            length_beats = float(loop_end.attrib['Value']) - float(loop_start.attrib['Value'])
-        except (ValueError, TypeError):
-            pass
+    # LoopStart/LoopEnd live inside Loop child of MidiClip in ALS
+    loop_elem = find_element_by_tag(midi_clip, 'Loop')
+    if loop_elem is not None:
+        loop_start = find_element_by_tag(loop_elem, 'LoopStart')
+        loop_end = find_element_by_tag(loop_elem, 'LoopEnd')
+        if loop_start is not None and 'Value' in loop_start.attrib and loop_end is not None and 'Value' in loop_end.attrib:
+            try:
+                length_beats = float(loop_end.attrib['Value']) - float(loop_start.attrib['Value'])
+            except (ValueError, TypeError):
+                pass
     notes_elem = find_element_by_tag(midi_clip, 'Notes')
     if notes_elem is None:
         return (0, length_beats, [])
@@ -2106,17 +2109,19 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
             
             # CRITICAL: Extract LoopStart offset BEFORE processing notes
             # Note times in Ableton are relative to the clip start (LoopStart)
-            # We need to subtract this offset to get times relative to sequence start
+            # LoopStart lives inside Loop child of MidiClip in ALS.
             loop_start_offset = 0.0
             if midi_clip:
-                loop_start_elem = find_element_by_tag(midi_clip, 'LoopStart')
-                if loop_start_elem is not None and 'Value' in loop_start_elem.attrib:
-                    try:
-                        loop_start_offset = float(loop_start_elem.attrib['Value'])
-                        if sublayer_idx == 0:  # Only log for first sublayer
-                            logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: LoopStart = {loop_start_offset} beats (will subtract from note times)')
-                    except (ValueError, TypeError) as e:
-                        logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Error extracting LoopStart: {e}')
+                loop_elem = find_element_by_tag(midi_clip, 'Loop')
+                if loop_elem is not None:
+                    loop_start_elem = find_element_by_tag(loop_elem, 'LoopStart')
+                    if loop_start_elem is not None and 'Value' in loop_start_elem.attrib:
+                        try:
+                            loop_start_offset = float(loop_start_elem.attrib['Value'])
+                            if sublayer_idx == 0:  # Only log for first sublayer
+                                logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: LoopStart = {loop_start_offset} beats (will subtract from note times)')
+                        except (ValueError, TypeError) as e:
+                            logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Error extracting LoopStart: {e}')
             
             if midi_clip:
                 notes = find_element_by_tag(midi_clip, 'Notes')
@@ -2222,22 +2227,34 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
             current_start_elem = find_element_by_tag(midi_clip, 'CurrentStart') if midi_clip else None
             current_end_elem = find_element_by_tag(midi_clip, 'CurrentEnd') if midi_clip else None
             if midi_clip:
-                # Method 1: LoopStart/LoopEnd = loop region (the repeating pattern length)
-                loop_start_elem = find_element_by_tag(midi_clip, 'LoopStart')
-                loop_end_elem = find_element_by_tag(midi_clip, 'LoopEnd')
-                if loop_start_elem is not None and 'Value' in loop_start_elem.attrib and \
-                   loop_end_elem is not None and 'Value' in loop_end_elem.attrib:
-                    try:
-                        loop_start = float(loop_start_elem.attrib['Value'])
-                        loop_end = float(loop_end_elem.attrib['Value'])
-                        loop_len = loop_end - loop_start
-                        if loop_len > 0 and loop_len <= 256.0:
-                            clip_length_beats = loop_len
-                            logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length from LoopStart/LoopEnd = {clip_length_beats} beats')
-                    except (ValueError, TypeError) as e:
-                        logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Error LoopStart/LoopEnd: {e}')
-                
-                # Method 2: CurrentStart/CurrentEnd = play range (use when no loop, or loop not usable)
+                # Method 1: LoopStart/LoopEnd = loop region ONLY when loop is enabled.
+                # When loop is off, using loop points would give wrong length (e.g. 2-bar region on a 32-bar clip).
+                # LoopOn, LoopStart, LoopEnd live inside Loop child of MidiClip in ALS.
+                loop_elem = find_element_by_tag(midi_clip, 'Loop')
+                loop_on = False
+                if loop_elem is not None:
+                    loop_on_elem = find_element_by_tag(loop_elem, 'LoopOn')
+                    if loop_on_elem is not None and 'Value' in loop_on_elem.attrib:
+                        v = str(loop_on_elem.attrib['Value']).strip().lower()
+                        loop_on = v in ('1', 'true', 'on')
+                if loop_on and loop_elem is not None:
+                    loop_start_elem = find_element_by_tag(loop_elem, 'LoopStart')
+                    loop_end_elem = find_element_by_tag(loop_elem, 'LoopEnd')
+                    if loop_start_elem is not None and 'Value' in loop_start_elem.attrib and \
+                       loop_end_elem is not None and 'Value' in loop_end_elem.attrib:
+                        try:
+                            loop_start = float(loop_start_elem.attrib['Value'])
+                            loop_end = float(loop_end_elem.attrib['Value'])
+                            loop_len = loop_end - loop_start
+                            if loop_len > 0 and loop_len <= 256.0:
+                                clip_length_beats = loop_len
+                                logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length from LoopStart/LoopEnd (loop on) = {clip_length_beats} beats')
+                        except (ValueError, TypeError) as e:
+                            logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Error LoopStart/LoopEnd: {e}')
+                else:
+                    logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Loop off, not using LoopStart/LoopEnd for length')
+                # Method 2: Clip End - Clip Start is the best source of truth for length (e.g. Seq 15: End 9 - Start 1 = 8 bars).
+                # In ALS this is CurrentEnd - CurrentStart (arrangement play extent). Use this when loop is off or no loop length yet.
                 play_range = None
                 if clip_length_beats <= 1.0 and current_start_elem is not None and 'Value' in current_start_elem.attrib and \
                    current_end_elem is not None and 'Value' in current_end_elem.attrib:
@@ -2245,12 +2262,32 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                         cs = float(current_start_elem.attrib['Value'])
                         ce = float(current_end_elem.attrib['Value'])
                         play_range = ce - cs
-                        if play_range > 0 and play_range <= 256.0:
-                            clip_length_beats = play_range
-                            logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length from play range (CurrentEnd-CurrentStart) = {clip_length_beats} beats')
+                        if play_range > 0:
+                            # Clip End - Start: if value >= 16 assume beats; if 1-15 assume bars (e.g. 9-1=8 bars)
+                            if play_range >= 16.0 and play_range <= 256.0:
+                                clip_length_beats = play_range
+                                logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length from clip End-Start = {clip_length_beats} beats')
+                            elif play_range < 16.0:
+                                clip_length_beats = play_range * 4.0  # bars -> beats
+                                if clip_length_beats <= 256.0:
+                                    logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length from clip End-Start = {play_range} bars -> {clip_length_beats} beats')
                     except (ValueError, TypeError) as e:
                         logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Error CurrentStart/CurrentEnd: {e}')
-                
+                # When loop is off and we have notes, prefer note-derived length over play range only if it would shorten
+                # placement doesn't force wrong length (e.g. 32-bar span with 16-bar content).
+                if not loop_on and len(sublayer_events) > 0 and clip_length_beats > 1.0:
+                    max_time = 0.0
+                    for event in sublayer_events:
+                        note_end_beats = event.get('time_val', 0) + event.get('dur_val', 0)
+                        max_time = max(max_time, note_end_beats)
+                    if max_time > 0:
+                        note_derived = int((max_time + 3) // 4) * 4
+                        if note_derived < 4:
+                            note_derived = max(4, int(max_time + 0.5))
+                        if note_derived >= 4 and note_derived < clip_length_beats:
+                            old_len = clip_length_beats
+                            clip_length_beats = float(note_derived)
+                            logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Loop off, using note-derived length = {clip_length_beats} beats (was {old_len})')
                 # Method 2b: When play range is large (>16 beats), clip likely loops across arrangement.
                 # Use note-derived length instead – the actual loop is the content, not the placement span.
                 if play_range is not None and play_range > 16.0 and len(sublayer_events) > 0:
@@ -2902,13 +2939,14 @@ def build_midi_to_pad_map(pad_list):
         if pad.get('midi_note') is not None:
             midi_to_pad[pad['midi_note']] = pad['blackbox_pad']
     
-    # Fallback: standard drum rack MIDI mapping
+    # Fallback: when ReceivingNote not in ALS, use Ableton's common default (37-52 → pads 0-15).
+    # Some projects use 36-51; 37-52 (C#2–E3) matches many drum racks and fixes Seq 13-16 pad mapping.
     if not midi_to_pad:
-        logger.warning('No MIDI notes found in pad_list, using standard mapping (36-51 → 0-15)')
+        logger.warning('No MIDI notes found in pad_list, using fallback mapping (37-52 → 0-15)')
         for pad in pad_list:
             pad_num = pad.get('blackbox_pad')
             if pad_num is not None:
-                midi_to_pad[36 + pad_num] = pad_num
+                midi_to_pad[37 + pad_num] = pad_num
     
     logger.debug(f'Created MIDI note to pad mapping: {midi_to_pad}')
     return midi_to_pad

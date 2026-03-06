@@ -202,3 +202,51 @@ Default values for clip mode pads:
    - `chan` should be `256 + pad_number` to trigger the correct pad
    - Example: To trigger pad 1, use `chan="257"` and `pitch="0"`
 
+---
+
+## Song Mode (Preset XML)
+
+**Note:** In song mode, “chan” means section state (which pad/seq is ON or Keep). This is separate from sequence *note* events, where chan 256+ selects the pad in Pads mode.
+
+Song mode is stored in **layer 2** cells with `type="section"`. Each section cell has a `<sequence>` containing **sceneitem** events (not note events). Channel numbers in this context mean something different from sequence note events.
+
+### Section cells
+- `<cell layer="2" type="section">` — one cell per song section (e.g. "0 Intro", "1 Beat").
+- `params.sectionrepeats` — how many times the section repeats.
+- The section’s `<sequence>` lists `<seqevent type="sceneitem">` entries that define which pads and sequences are ON, OFF, or Keep in that section.
+
+### Channel mapping in song mode (sceneitem events)
+
+| Chan in XML | Meaning (human) | Use |
+|-------------|------------------|-----|
+| (no `chan` attribute) | **Pad 1** | First pad state (silayer 0 or 1). |
+| `chan="0"` … `chan="15"` | **Pad 1 … Pad 16** | Pad states: chan 0 = Pad 1, chan 3 = Pad 4, chan 15 = Pad 16. |
+| `chan="256"` … `chan="271"` | **Seq 1 … Seq 16** | Sequence states: chan 256 = Seq 1, chan 259 = Seq 4, chan 271 = Seq 16. |
+
+So in song mode:
+- **Pads** are addressed by chan **0–15** (or no chan = Pad 1).
+- **Seqs** are addressed by chan **256–271** (Seq 1–16).
+
+This is the opposite of sequence *note* events, where chan 256+ is used to trigger pads in Pads mode.
+
+### Sceneitem attributes
+- `type="sceneitem"` — marks the event as a scene/section state, not a note.
+- `chan` — as in the table above (omit for Pad 1).
+- `silayer` — sub-layer:
+  - `0` = main pad/seq (layer A).
+  - `1` = layer B (e.g. Pad 15 layer B, Pad 16 layer B).
+  - `4` = special “scene” block (e.g. no chan + silayer 4, or chan 15 silayer 4) used in some section layouts.
+- `cond` — state:
+  - `0` = off.
+  - `1` = on (trigger in this section).
+  - `2` = keep (continue from previous section).
+
+### Layout variants
+- **Standard layout**: Pad 1 (no chan), Pads 2–16 (chan 1–15), then Seq 1–16 (chan 256–271).
+- **Alt layout** (e.g. “1 Beat”, “2 Main”): Pads as chan 1–14 or 1–15, then Seq 2–16 as chan 257–271, then a silayer 4 block (no chan cond 2, chan 256 cond 0, optionally chan 15 silayer 4 cond 0).
+
+### Pad vs seq in song mode
+- Pad state (chan 0–15) and seq state (chan 256–271) are separate.
+- When a pad has **ON** (cond 1) in silayer 0, that pad “carries” the seq: the corresponding seq is not output (cleared). **Keep** (cond 2) does not clear the seq.
+- Pads come from the “Pads” track in the converter; seqs come from the Seq tracks. They are written to different chan ranges in the preset XML as above.
+
