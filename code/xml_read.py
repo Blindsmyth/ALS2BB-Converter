@@ -1945,7 +1945,11 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
         unquantised: Legacy parameter, now ignored (automatic detection used)
     """
     logger.info(f'Processing {len(midi_tracks)} MIDI tracks for sequences (firmware 2.3+ format)...')
-    
+
+    # Track which seq slots (0-15) have been filled by an actual track.
+    # Slots not in this set at the end receive placeholder cells (e.g. missing Seq2).
+    filled_seq_slots = set()
+
     # Create MIDI note to pad number mapping for pads mode
     # In pads mode, each seqevent's pitch value (0-15) determines which pad gets triggered
     midi_to_pad = build_midi_to_pad_map(pad_list)
@@ -1962,15 +1966,17 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
         if midi_track_info and track_idx < len(midi_track_info):
             track_name = midi_track_info[track_idx][1]
         
-        # Determine target pad from routing (not from track name or index)
-        # For Keys mode: routing to specific pad via branch_id determines target_pad
-        # For Pads mode: sequence location is ALWAYS determined by track index (CRITICAL: must match track_idx)
-        target_pad = track_idx  # Default: use track index for sequence location
-        
+        # Determine target pad from routing (not from track name or index).
+        # For Pads mode: use the HUMAN seq index (SeqN → dest=N-1) so that missing sequences
+        # (e.g. Seq2 absent from the project) leave their slot empty and every present seq lands
+        # at the correct Blackbox pad slot. Dense array index would shift every seq after a gap.
+        seq_human_idx = _seq_index_from_track(track, track_idx, midi_track_info)
+        target_pad = seq_human_idx  # Default: human-based pad slot
+
         if seq_mode == 'Keys' and mode_target is not None:
             # mode_target is the branch_id from the routing (e.g., B40 → 40)
             branch_id = mode_target
-            
+
             # Find which pad has this branch_id
             target_found = False
             for pad in pad_list:
@@ -1979,19 +1985,16 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                     target_found = True
                     logger.info(f'  Keys mode: Branch Id {branch_id} maps to Pad {target_pad}')
                     break
-            
+
             if not target_found:
-                # Branch Id not found, fall back to track position
                 logger.warning(f'  Keys mode: Branch Id {branch_id} not found in drum rack')
-                logger.warning(f'  Falling back to track position (Pad {track_idx})')
-                target_pad = track_idx
-        
-        # For row/column calculation:
-        # CRITICAL: Sequence location (row/column) ALWAYS matches track index for both Pads and Keys mode
-        # The seqpadmapdest parameter determines which pad the sequence plays, not where it's located
-        # This ensures track 0 → location pad 0, track 1 → location pad 1, etc.
-        sequence_location_pad = track_idx
+                logger.warning(f'  Falling back to human seq index (Pad {seq_human_idx})')
+                target_pad = seq_human_idx
+
+        # Sequence grid location uses the same human-based index for both modes.
+        sequence_location_pad = target_pad
         row, column = row_column(sequence_location_pad)
+        filled_seq_slots.add(sequence_location_pad)
         
         # CRITICAL: Store row/column as local variables to avoid any potential scope issues
         sequence_row = row
@@ -2636,8 +2639,34 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
             logger.info(f'  Sequence at pad {sequence_location_pad}: Created 4 sub-layers ({total_notes_all_layers} total notes)')
         else:
             logger.debug(f'  Sequence at pad {sequence_location_pad}: No MIDI clips found')
-    
-    # Expected preset has 80 sequence cells: 64 + 16 empty at column 4 (row 0-3 x seqsublayer 0-3)
+
+    # Emit placeholder cells for any seq slots (0-15) not covered by an actual track.
+    # This handles missing seq numbers (e.g. Seq2 absent from the project): the Blackbox preset
+    # must have cells for every slot even if the slot has no content.
+    default_seq_params = {
+        'notesteplen': '10', 'notestepcount': '8', 'dutycyc': '1000', 'quantsizeseq': '1',
+        'dispmode': '0', 'seqplayenable': '0', 'activeseqlayer': '0',
+        'midioutchan': '0', 'seqstepmode': '1', 'midiseqcellchan': '0'
+    }
+    filled_slots = set(filled_seq_slots)
+    for slot in range(16):
+        if slot in filled_slots:
+            continue
+        row, col = row_column(slot)
+        logger.info(f'  Emitting placeholder cells for missing seq slot {slot} (row={row}, col={col})')
+        for sublayer_idx in range(4):
+            cell = ET.SubElement(session, 'cell')
+            cell.attrib = {
+                'row': str(row), 'column': str(col), 'layer': '1',
+                'seqsublayer': str(sublayer_idx), 'type': 'noteseq'
+            }
+            params = ET.SubElement(cell, 'params')
+            p = dict(default_seq_params)
+            p['seqpadmapdest'] = str(slot)
+            params.attrib = p
+            ET.SubElement(cell, 'sequence')
+
+    # Column-4 padding cells (16 total, rows 0-3 × sublayers 0-3)
     empty_seq_params = {
         'notesteplen': '10', 'notestepcount': '16', 'dutycyc': '1000', 'quantsizeseq': '1',
         'dispmode': '0', 'seqpadmapdest': '0', 'seqplayenable': '0', 'activeseqlayer': '0',
@@ -2653,8 +2682,8 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
             params = ET.SubElement(cell, 'params')
             params.attrib = dict(empty_seq_params)
             ET.SubElement(cell, 'sequence')
-    
-    logger.info(f'Sequence extraction complete (64 + 16 empty column-4 cells)')
+
+    logger.info(f'Sequence extraction complete (64 active + placeholders + 16 empty column-4 cells)')
     return session
 
 
