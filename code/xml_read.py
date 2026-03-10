@@ -473,7 +473,9 @@ def drum_rack_extract(drum_rack_device):
             branch_info = find_element_by_tag(branch, 'BranchInfo')
             if branch_info:
                 receiving_note = find_element_by_tag(branch_info, 'ReceivingNote')
-                if receiving_note and 'Value' in receiving_note.attrib:
+                # IMPORTANT: use `is not None`, NOT `if receiving_note` — ElementTree evaluates
+                # leaf nodes (no children) as falsy even when they have attributes.
+                if receiving_note is not None and 'Value' in receiving_note.attrib:
                     midi_note = int(receiving_note.attrib['Value'])
                     pad_info['midi_note'] = midi_note
                 
@@ -2965,25 +2967,29 @@ def make_master(root, tempo, songmode_enabled=False, section_count=1):
 
 def build_midi_to_pad_map(pad_list):
     """
-    Build a mapping from MIDI note to Blackbox pad index using pad metadata.
-    Falls back to the standard drum rack convention (36–51 → pads 0–15)
-    when explicit midi_note values are not present.
+    Build a mapping from MIDI note to Blackbox pad index.
+
+    Seq tracks encode pad voices using notes 36-51 (note 36 = pad 0, note 37 = pad 1, ...).
+    This is the Blackbox workflow convention and is independent of the drum rack's own
+    ReceivingNote values (which are often in a completely different range, e.g. 77-92).
+    We seed the map with the standard 36-51 baseline first, then overlay actual drum
+    rack ReceivingNote values — the two ranges typically don't overlap.
     """
-    midi_to_pad = {}
+    # Standard baseline: note 36 → pad 0, note 37 → pad 1, ..., note 51 → pad 15
+    midi_to_pad = {36 + i: i for i in range(16)}
+
+    # Overlay with actual ReceivingNote values from the drum rack.
+    # This handles non-standard drum racks and avoids breaking Keys-mode routing.
+    found_any = False
     for pad in pad_list:
         if pad.get('midi_note') is not None:
             midi_to_pad[pad['midi_note']] = pad['blackbox_pad']
-    
-    # Fallback: when ReceivingNote not in ALS, use Ableton's common default (37-52 → pads 0-15).
-    # Some projects use 36-51; 37-52 (C#2–E3) matches many drum racks and fixes Seq 13-16 pad mapping.
-    if not midi_to_pad:
-        logger.warning('No MIDI notes found in pad_list, using fallback mapping (37-52 → 0-15)')
-        for pad in pad_list:
-            pad_num = pad.get('blackbox_pad')
-            if pad_num is not None:
-                midi_to_pad[37 + pad_num] = pad_num
-    
-    logger.debug(f'Created MIDI note to pad mapping: {midi_to_pad}')
+            found_any = True
+
+    if not found_any:
+        logger.warning('No ReceivingNote values found in drum rack — using standard 36-51 → 0-15 baseline only')
+
+    logger.debug(f'Created MIDI note to pad mapping (36-51 baseline + drum rack overlay): {len(midi_to_pad)} entries')
     return midi_to_pad
 
 
