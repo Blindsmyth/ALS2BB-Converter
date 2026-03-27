@@ -232,6 +232,14 @@ The converter automatically detects warped samples by checking:
 - `loopmode="1"` (loop enabled)
 - `beatcount` = extracted from warp markers or calculated from duration
 
+### Beta branch: Clip mode + transient `<slices>` (`beta/clip-transients`)
+
+On **`main`**, warped Simplers in **Classic** playback do **not** use auto-onset data as slice markers (that data would incorrectly force **slicer** mode).
+
+On **`beta/clip-transients`**, the same pads stay in **clip mode** (`cellmode="1"`), but Ableton's **`InitialSlicePointsFromOnsets`** are also written into the preset as `<slice pos="..."/>` entries so Blackbox clip playback can use transients where supported. If there are more than **128** onsets, the list is reduced with a **density-priority** rule (keeps sparse boundaries and prefers dense transient clusters).
+
+**Simpler slicing mode** (manual / beat / region slices, or unwarped transients when onset editing applies) still maps to **slicer** mode (`cellmode="2"`) and is unchanged.
+
 **Unwarped samples** → **Sampler Mode** (`cellmode="0"`):
 - One-shot or sampler mode
 - `loopmode="0"` (no auto-loop)

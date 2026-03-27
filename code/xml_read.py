@@ -45,6 +45,83 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Beta branch (beta/clip-transients): max slice markers embedded on clip-mode (warped) cells
+CLIP_TRANSIENT_SLICE_MAX_BETA = 128
+
+
+def _parse_slice_point_container(container):
+    """Parse Ableton slice point container to seconds and/or sample indices."""
+    seconds = []
+    samples = []
+    for point in list(container):
+        attrib = point.attrib
+        if 'TimeInSeconds' in attrib:
+            try:
+                seconds.append(float(attrib['TimeInSeconds']))
+                continue
+            except ValueError:
+                pass
+        if 'Time' in attrib:
+            try:
+                seconds.append(float(attrib['Time']))
+                continue
+            except ValueError:
+                pass
+        for key in ('SampleIndex', 'Samples', 'Sample'):
+            if key in attrib:
+                try:
+                    samples.append(int(round(float(attrib[key]))))
+                    break
+                except ValueError:
+                    pass
+    return seconds, samples
+
+
+def limit_slice_positions_density_priority(positions, max_count, samlen_int=None):
+    """
+    Reduce slice onset count while preferring regions where onsets are dense (short gaps).
+    Always keeps the first and last onset; fills remaining slots with highest-scoring interiors.
+
+    Used for beta clip-mode transient embeds (hardware / MIDI practical limit).
+    """
+    if max_count < 1:
+        return []
+    uniq = sorted(set(int(max(0, p)) for p in positions))
+    if not uniq:
+        return []
+    if samlen_int is not None and samlen_int > 0:
+        uniq = [min(p, samlen_int) for p in uniq]
+        uniq = sorted(set(uniq))
+    if 0 not in uniq:
+        uniq.insert(0, 0)
+        uniq.sort()
+    if len(uniq) <= max_count:
+        return uniq
+    first, last = uniq[0], uniq[-1]
+    inner = uniq[1:-1]
+    if not inner:
+        return uniq[:max_count]
+    budget = max_count - 2
+    if budget <= 0:
+        return [first] if max_count == 1 else [first, last]
+    full = uniq
+    scored = []
+    for i in range(1, len(full) - 1):
+        p = full[i]
+        d_prev = max(full[i] - full[i - 1], 1)
+        d_next = max(full[i + 1] - full[i], 1)
+        score = (1.0 / d_prev) + (1.0 / d_next)
+        scored.append((score, i, p))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    chosen = {first, last}
+    for j in range(min(budget, len(scored))):
+        chosen.add(scored[j][2])
+    out = sorted(chosen)
+    if samlen_int is not None and samlen_int > 0:
+        out = [min(p, samlen_int) for p in out]
+        out = sorted(set(out))
+    return out
+
 
 def get_wav_info(filepath):
     """
@@ -732,32 +809,6 @@ def _collect_slice_points(sample_part):
         'InitialSlicePointsFromOnsets'
     ]
     
-    def _parse_container(container):
-        seconds = []
-        samples = []
-        for point in list(container):
-            attrib = point.attrib
-            if 'TimeInSeconds' in attrib:
-                try:
-                    seconds.append(float(attrib['TimeInSeconds']))
-                    continue
-                except ValueError:
-                    pass
-            if 'Time' in attrib:
-                try:
-                    seconds.append(float(attrib['Time']))
-                    continue
-                except ValueError:
-                    pass
-            for key in ('SampleIndex', 'Samples', 'Sample'):
-                if key in attrib:
-                    try:
-                        samples.append(int(round(float(attrib[key]))))
-                        break
-                    except ValueError:
-                        pass
-        return seconds, samples
-    
     # Check whether the sample is warped. If IsWarped=true the Simpler is in Clip/Warp
     # mode (not Slice mode), so auto-detected onset points should NOT trigger slice mode.
     warp_props = find_element_by_tag(sample_part, 'SampleWarpProperties')
@@ -780,7 +831,7 @@ def _collect_slice_points(sample_part):
                 editable_el = find_element_by_tag(sample_part, 'AreSlicesFromOnsetsEditable')
                 if editable_el is None or editable_el.attrib.get('Value', 'false').lower() != 'true':
                     continue
-            seconds, samples = _parse_container(container)
+            seconds, samples = _parse_slice_point_container(container)
             if seconds or samples:
                 return tag, seconds, samples
     
@@ -788,14 +839,7 @@ def _collect_slice_points(sample_part):
     if not is_warped and warp_props is not None:
         user_onsets = warp_props.find('.//UserOnsets')
         if user_onsets is not None and len(user_onsets):
-            seconds = []
-            for onset in list(user_onsets):
-                attrib = onset.attrib
-                if 'Time' in attrib:
-                    try:
-                        seconds.append(float(attrib['Time']))
-                    except ValueError:
-                        continue
+            seconds, _samples = _parse_slice_point_container(user_onsets)
             if seconds:
                 return 'UserOnsets', seconds, []
     return None, [], []
@@ -817,7 +861,9 @@ def extract_slicing_info(device, sample_part):
         'slicing_playback_mode': None,
         'playthrough': False,
         'beat_grid': None,
-        'transpose_cents': extract_transpose_cents(device)
+        'transpose_cents': extract_transpose_cents(device),
+        # Beta: warped classic clip — onset positions for <slices> without forcing slicer mode
+        'clip_transient_embed_samples': [],
     }
     
     if device is None or sample_part is None:
@@ -839,6 +885,27 @@ def extract_slicing_info(device, sample_part):
                     info['default_sample_rate'] = float(rate_elem.attrib['Value'])
                 except ValueError:
                     pass
+
+        # Beta: extract Auto Onsets for warped samples (Classic + Warp → clip mode + transient embed)
+        warp_props_embed = find_element_by_tag(sample_part, 'SampleWarpProperties')
+        is_warped_embed = False
+        if warp_props_embed is not None:
+            iw_embed = find_element_by_tag(warp_props_embed, 'IsWarped')
+            if iw_embed is not None and iw_embed.attrib.get('Value', 'false').lower() == 'true':
+                is_warped_embed = True
+        if is_warped_embed:
+            onsets_container = find_element_by_tag(sample_part, 'InitialSlicePointsFromOnsets')
+            if onsets_container is not None and len(onsets_container):
+                sec_emb, smp_emb = _parse_slice_point_container(onsets_container)
+                embed_pts = list(smp_emb)
+                if sec_emb and info['default_sample_rate']:
+                    embed_pts.extend(
+                        int(round(s * float(info['default_sample_rate']))) for s in sec_emb
+                    )
+                embed_pts.append(0)
+                info['clip_transient_embed_samples'] = sorted(
+                    set(max(0, int(p)) for p in embed_pts)
+                )
         
         # Record slicing parameters stored on the sample part
         style_elem = find_element_by_tag(sample_part, 'SlicingStyle')
@@ -1488,6 +1555,13 @@ def make_drum_rack_pads(session, pad_list, tempo):
                 if has_slices:
                     cellmode = '2'
                     loopmode = '0'
+                # Beta: warped classic (clip) — keep cellmode 1; embed onsets under <slices> (not full slicer mode)
+                clip_transient_embed_only = (
+                    not has_slices
+                    and cellmode == '1'
+                    and warp_info.get('is_warped', False)
+                    and bool(slicing_info.get('clip_transient_embed_samples'))
+                )
                 
                 # For clip mode samples, use default envelope settings
                 # 0% attack, 100% decay, 100% sustain, 20% release
@@ -1566,6 +1640,38 @@ def make_drum_rack_pads(session, pad_list, tempo):
                         except (TypeError, ValueError):
                             slice_positions = [max(0, int(pos)) for pos in slice_positions]
                         slice_positions = sorted(set(slice_positions))
+                elif clip_transient_embed_only:
+                    default_rate = slicing_info.get('default_sample_rate')
+                    slice_positions = list(slicing_info.get('clip_transient_embed_samples', []))
+                    if slice_positions and wav_info and default_rate and default_rate > 0:
+                        try:
+                            if float(default_rate) != float(wav_info['sample_rate']):
+                                scale = float(wav_info['sample_rate']) / float(default_rate)
+                                slice_positions = [int(round(pos * scale)) for pos in slice_positions]
+                        except (TypeError, ValueError):
+                            pass
+                    if slice_positions:
+                        if 0 not in slice_positions:
+                            slice_positions.append(0)
+                        try:
+                            samlen_int = int(float(samlen))
+                            slice_positions = [max(0, min(int(pos), samlen_int)) for pos in slice_positions]
+                        except (TypeError, ValueError):
+                            slice_positions = [max(0, int(pos)) for pos in slice_positions]
+                        slice_positions = sorted(set(slice_positions))
+                        before_ct = len(slice_positions)
+                        try:
+                            samlen_int_lim = int(float(samlen))
+                        except (TypeError, ValueError):
+                            samlen_int_lim = None
+                        slice_positions = limit_slice_positions_density_priority(
+                            slice_positions, CLIP_TRANSIENT_SLICE_MAX_BETA, samlen_int_lim
+                        )
+                        if before_ct > len(slice_positions):
+                            logger.info(
+                                f'    → Clip transient embed: {before_ct} onsets → {len(slice_positions)} '
+                                f'(max {CLIP_TRANSIENT_SLICE_MAX_BETA}, density priority)'
+                            )
                 
                 # Handle multisample mode
                 if params.get('multisammode') == '1':

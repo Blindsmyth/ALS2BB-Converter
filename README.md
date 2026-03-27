@@ -82,6 +82,8 @@ The converter fully supports Ableton Simpler's slicing mode and converts it to B
 
 *Example showing slicer mode with playthrough enabled. Note that all transients that are in the clip are being extracted as slice points.*
 
+**Branch note (`beta/clip-transients`)**: On this beta branch, **warped Classic (clip) pads** keep `cellmode="1"` but still emit **Ableton auto-onset** positions under `<slices>` (capped at **128** with density-priority reduction) so Blackbox can use transients in clip-style playback where supported. Full **Simpler slicing mode** still maps to slicer (`cellmode="2"`).
+
 ### 🎚️ Advanced Features
 - **Choke Groups**: Automatic extraction and mapping (A-D groups)
 - **Warp Detection**: Identifies time-stretched samples
