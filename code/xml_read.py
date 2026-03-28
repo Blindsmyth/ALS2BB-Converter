@@ -2080,6 +2080,31 @@ def _midi_clip_signature(midi_clip):
     return (len(notes_list), length_beats, notes_list)
 
 
+def _midi_note_event_time_duration(note_event):
+    """
+    Read (Time, Duration) from a MidiNoteEvent.
+    Ableton 12.3+ uses XML attributes; older projects use <Time>/<Duration> child elements.
+    Matches extraction in make_drum_rack_sequences / _midi_clip_signature.
+    """
+    if 'Time' in note_event.attrib:
+        try:
+            t = float(note_event.attrib.get('Time', 0))
+            d = float(note_event.attrib.get('Duration', 0))
+            return (t, d)
+        except (ValueError, TypeError):
+            return None
+    time_el = find_element_by_tag(note_event, 'Time')
+    dur_el = find_element_by_tag(note_event, 'Duration')
+    if time_el is None:
+        return None
+    try:
+        t = float(time_el.attrib.get('Value', 0))
+        d = float(dur_el.attrib.get('Value', 0)) if dur_el is not None else 0.0
+        return (t, d)
+    except (ValueError, TypeError):
+        return None
+
+
 def _max_note_span_in_clip(midi_clip):
     """Max (Time + Duration) over all MidiNoteEvents in clip, in ALS time units."""
     max_end = 0.0
@@ -2094,20 +2119,20 @@ def _max_note_span_in_clip(midi_clip):
         if notes_container is None:
             continue
         for note_event in notes_container:
-            if 'Time' not in note_event.attrib:
+            parsed = _midi_note_event_time_duration(note_event)
+            if parsed is None:
                 continue
-            try:
-                t = float(note_event.attrib.get('Time', 0))
-                d = float(note_event.attrib.get('Duration', 0))
-            except (ValueError, TypeError):
-                continue
+            t, d = parsed
             max_end = max(max_end, t + d)
     return max_end
 
 
-def _clip_length_beats_from_midi_clip(midi_clip):
+def _clip_length_beats_from_midi_clip(midi_clip, extracted_note_count=0):
     """
     Convert ALS clip loop / arrangement bounds to sequence length in beats.
+
+    extracted_note_count: notes already parsed for this sub-layer (must match KeyTracks). When > 0,
+    we never collapse a long arrangement slot to the short “empty gap” cap even if XML span is ~0.
 
     Do not use raw MIDI note Duration here for output length: step_count uses this value;
     long-held notes in clips are not reliable indicators of loop length.
@@ -2191,6 +2216,14 @@ def _clip_length_beats_from_midi_clip(midi_clip):
         # Applying /2 wrongly halves (e.g. Seq13B 80→40 beats, Seq16B 244→122 beats).
         if note_max < eps:
             pr = max(1.0, min(play_range, 256.0))
+            # If we already parsed notes from KeyTracks, never treat this as an empty clip — e.g. XML
+            # span heuristics can miss some layouts; leading silence + notes still needs full timeline.
+            if extracted_note_count > 0:
+                logger.debug(
+                    f'Clip length: XML note span ~0 but {extracted_note_count} notes extracted; '
+                    f'play_range={pr} beats (arrangement)'
+                )
+                return pr
             # Long arrangement blocks with no MIDI are usually timeline gaps (session template or muted
             # lane), e.g. Seq15 B spanning to the next locator — not a 128-beat sequence to export.
             if pr >= 96:
@@ -2582,7 +2615,9 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
             clip_length_beats = 1.0
             clip_for_length = length_clip if length_clip is not None else midi_clip
             if clip_for_length:
-                clip_length_beats = _clip_length_beats_from_midi_clip(clip_for_length)
+                clip_length_beats = _clip_length_beats_from_midi_clip(
+                    clip_for_length, extracted_note_count=len(sublayer_events)
+                )
                 logger.info(
                     f'    Sub-layer {chr(65+sublayer_idx)}: clip_length_beats={clip_length_beats:.2f} '
                     f'(_clip_length_beats_from_midi_clip)'
