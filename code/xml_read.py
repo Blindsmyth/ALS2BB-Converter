@@ -3119,6 +3119,29 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
         # seq_conds are independent of pad_conds — no merging or clearing needed.
         _seq_conds = dict(extracted_seq_conds)
 
+        # Pad block (chan 0–15) vs seq block (chan 256–271) are separate in firmware. Golden CE
+        # sections use pad-only cond=1 with all seq chans 0, so we never merge pad_conds into
+        # _seq_conds here. When debugging “UI shows pattern but seq silent”, run with DEBUG:
+        if logger.isEnabledFor(logging.DEBUG):
+            for pad_idx, silayer_arm, pcond in pad_events:
+                if int(pcond or 0) < 1:
+                    continue
+                seq_max = max(
+                    int(_seq_conds.get((pad_idx, ly), 0) or 0) for ly in range(4)
+                )
+                if seq_max == 0:
+                    logger.debug(
+                        'Song row=%s name=%r: arrangement arms pad chan=%s silayer=%s cond=%s; '
+                        'Seq track %s has no seq-block sceneitem (Pads clip: MIDI %s or Keep name).',
+                        row_idx,
+                        sec_name,
+                        pad_idx,
+                        silayer_arm,
+                        pcond,
+                        pad_idx + 1,
+                        36 + pad_idx,
+                    )
+
         # Pads: "1 Beat" omits pad 15 from the main pad block and emits it on silayer 4 (legacy preset).
         if sec_name == '1 Beat':
             pad_end = 14

@@ -248,5 +248,5 @@ This is the opposite of sequence *note* events, where chan 256+ is used to trigg
 ### Pad vs seq in song mode
 - Pad state (chan 0–15) and seq state (chan 256–271) are separate.
 - When a pad has **ON** (cond 1) in silayer 0, that pad “carries” the seq: the corresponding seq is not output (cleared). **Keep** (cond 2) does not clear the seq.
-- Pads come from the “Pads” track in the converter; seqs come from the Seq tracks. They are written to different chan ranges in the preset XML as above.
+- **Converter mapping (Ableton → preset XML):** the **pad block** (chan 0–15) is driven by **Seq** track arrangement clips (`A`/`B`/…/`Keep`). The **seq block** (chan 256–271) is driven by the **Pads** track (notes 36+ and `Keep` clip names). They are written to different chan ranges as above. For the common case where the UI shows a pattern but the sequence does not run in song mode, see **`docs/SONG_SECTION_PAD_VS_SEQ.md`**.
 

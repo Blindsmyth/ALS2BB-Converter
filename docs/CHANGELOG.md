@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-03
+
+### Documentation
+- **`docs/SONG_SECTION_PAD_VS_SEQ.md`** — Song sections: pad block (chan 0–15) vs seq block (chan 256–271), why the grid can show pattern A while playback does not arm that sequence, and how Seq vs Pads tracks map in the converter. Cross-linked from **`docs/BLACKBOX_TECHNICAL_REFERENCE.md`** (Song Mode); corrected the inverted “which Live track drives which block” sentence.
+
+### Converter
+- **`code/xml_read.py`** — DEBUG-only log when a section arms the pad block from Seq-track arrangement but the Pads track contributed no seq-block sceneitem for that seq index (helps diagnose song-mode UI vs playback mismatches without changing XML output).
+
 ## Version 0.3 (November 2024)
 
 ### Major Improvements
