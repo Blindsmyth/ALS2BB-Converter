@@ -3107,9 +3107,6 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
             pad_events.append((pad_idx, best_silayer, best_cond))
 
         sec_name = sec.get('name', '')
-        use_alt_layout = sec_name in ('1 Beat', '2 Main', '3 Break', 'Back 2 Climax', '4 Climax') or (
-            row_idx >= 2 and row_idx <= 6
-        )
 
         cell = ET.SubElement(session, 'cell')
         cell.attrib = {
@@ -3129,10 +3126,9 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
         # seq_conds are independent of pad_conds — no merging or clearing needed.
         _seq_conds = dict(extracted_seq_conds)
 
-        if use_alt_layout:
-            # Alt layout (preset_expected0403): pads 1-14 or 1-15, seqs 257-271, silayer 4 block
-            # 1 Beat: pads 1-14 only; others: pads 1-15
-            pad_end = 14 if sec_name == '1 Beat' else 15
+        # Pads: "1 Beat" omits pad 15 from the main pad block and emits it on silayer 4 (legacy preset).
+        if sec_name == '1 Beat':
+            pad_end = 14
             for pad_idx in range(1, pad_end + 1):
                 if pad_idx < len(pad_events):
                     _, silayer, cond = pad_events[pad_idx]
@@ -3142,46 +3138,36 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
                     'step': '0', 'chan': str(pad_idx), 'type': 'sceneitem',
                     'silayer': str(silayer), 'cond': str(cond),
                 })
-            # Seqs 257-271 (omit 256 from main block)
-            for seq_index in range(1, num_seqs):
-                chan_val = 256 + seq_index
-                for layer_idx in range(4):
-                    cond = int(_seq_conds.get((seq_index, layer_idx), 0))
-                    ET.SubElement(sequence, 'seqevent', attrib={
-                        'step': '0', 'chan': str(chan_val), 'type': 'sceneitem',
-                        'silayer': str(layer_idx), 'cond': str(cond),
-                    })
-            # Seq 1 (chan 256): four layers from Pads track data, then silayer-4 scene row.
-            # Emit 256 *before* silayer 4 and use cond=0 on silayer 4 (not 2) — matches hardware
-            # testing / corrected presets; old order + cond=2 caused first-hit and Keep glitches.
-            for layer_idx in range(4):
-                cond = int(_seq_conds.get((0, layer_idx), 0))
-                ET.SubElement(sequence, 'seqevent', attrib={
-                    'step': '0', 'chan': '256', 'type': 'sceneitem',
-                    'silayer': str(layer_idx), 'cond': str(cond),
-                })
-            ET.SubElement(sequence, 'seqevent', attrib={
-                'step': '0', 'type': 'sceneitem', 'silayer': '4', 'cond': '0',
-            })
-            if pad_end == 14:
-                ET.SubElement(sequence, 'seqevent', attrib={
-                    'step': '0', 'chan': '15', 'type': 'sceneitem', 'silayer': '4', 'cond': '0',
-                })
         else:
-            # Standard layout: pad 0 (no chan), pads 1-15, seqs 256-271
             for pad_idx, silayer, cond in pad_events:
                 attrs = {'step': '0', 'type': 'sceneitem', 'silayer': str(silayer), 'cond': str(cond)}
                 if pad_idx != 0:
                     attrs['chan'] = str(pad_idx)
                 ET.SubElement(sequence, 'seqevent', attrib=attrs)
-            for seq_index in range(num_seqs):
-                chan_val = 256 + seq_index
-                for layer_idx in range(4):
-                    cond = int(_seq_conds.get((seq_index, layer_idx), 0))
-                    ET.SubElement(sequence, 'seqevent', attrib={
-                        'step': '0', 'chan': str(chan_val), 'type': 'sceneitem',
-                        'silayer': str(layer_idx), 'cond': str(cond),
-                    })
+
+        # Seq channels: always 257–271 then 256, then silayer-4 terminator — same order in every
+        # section so song advance does not reorder scene application (avoids playhead glitches).
+        for seq_index in range(1, num_seqs):
+            chan_val = 256 + seq_index
+            for layer_idx in range(4):
+                cond = int(_seq_conds.get((seq_index, layer_idx), 0))
+                ET.SubElement(sequence, 'seqevent', attrib={
+                    'step': '0', 'chan': str(chan_val), 'type': 'sceneitem',
+                    'silayer': str(layer_idx), 'cond': str(cond),
+                })
+        for layer_idx in range(4):
+            cond = int(_seq_conds.get((0, layer_idx), 0))
+            ET.SubElement(sequence, 'seqevent', attrib={
+                'step': '0', 'chan': '256', 'type': 'sceneitem',
+                'silayer': str(layer_idx), 'cond': str(cond),
+            })
+        ET.SubElement(sequence, 'seqevent', attrib={
+            'step': '0', 'type': 'sceneitem', 'silayer': '4', 'cond': '0',
+        })
+        if sec_name == '1 Beat':
+            ET.SubElement(sequence, 'seqevent', attrib={
+                'step': '0', 'chan': '15', 'type': 'sceneitem', 'silayer': '4', 'cond': '0',
+            })
 
     # Expected preset has 32 section cells: 8 named + 24 empty (rows 8-31)
     num_named = len(sections)
@@ -3202,12 +3188,21 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
             ET.SubElement(sequence, 'seqevent', attrib={
                 'step': '0', 'chan': str(pad_idx), 'type': 'sceneitem', 'silayer': '0', 'cond': '0',
             })
-        for seq_index in range(num_seqs):
+        for seq_index in range(1, num_seqs):
             chan_val = 256 + seq_index
             for layer_idx in range(4):
                 ET.SubElement(sequence, 'seqevent', attrib={
-                    'step': '0', 'chan': str(chan_val), 'type': 'sceneitem', 'silayer': str(layer_idx), 'cond': '0',
+                    'step': '0', 'chan': str(chan_val), 'type': 'sceneitem',
+                    'silayer': str(layer_idx), 'cond': '0',
                 })
+        for layer_idx in range(4):
+            ET.SubElement(sequence, 'seqevent', attrib={
+                'step': '0', 'chan': '256', 'type': 'sceneitem',
+                'silayer': str(layer_idx), 'cond': '0',
+            })
+        ET.SubElement(sequence, 'seqevent', attrib={
+            'step': '0', 'type': 'sceneitem', 'silayer': '4', 'cond': '0',
+        })
 
     return root
 
@@ -3471,6 +3466,39 @@ def _clip_start_time(clip):
     return None
 
 
+def _clip_end_time(clip):
+    """Return CurrentEnd (arrangement extent) from a MidiClip, or None."""
+    ce = clip.find('CurrentEnd')
+    if ce is not None and 'Value' in ce.attrib:
+        try:
+            return float(ce.attrib['Value'])
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def _sections_overlapping_range(t0, t1, locators):
+    """
+    Indices of locator sections where [t0, t1) intersects [sec_start, sec_end).
+
+    Clips that begin in an earlier section but still play into the next must appear in
+    both (e.g. Seq1 B under "Break build" when the clip started in "Break2").
+    """
+    if not locators:
+        return []
+    if t1 < t0:
+        t0, t1 = t1, t0
+    if t1 == t0:
+        t1 = t0 + 1e-9
+    out = []
+    for idx in range(len(locators)):
+        sec_start = locators[idx]['time']
+        sec_end = locators[idx + 1]['time'] if idx + 1 < len(locators) else float('inf')
+        if t0 < sec_end and t1 > sec_start:
+            out.append(idx)
+    return out
+
+
 def _section_for_start(start_time, locators):
     """Return the 0-based section index that start_time falls into, or -1."""
     for idx in range(len(locators)):
@@ -3502,10 +3530,11 @@ def extract_pad_sections(tracks, pad_list, locators, tolerance_beats=0.1,
     For each locator section, produce PAD events from Seq track arrangement clips.
 
     Convention: each Seq track named 'SeqN' with an arrangement clip named 'A'/'B'/'C'/'D'
-    that STARTS in a section → PAD ON event at chan = N-1 (0-indexed), silayer = layer index.
-    'Keep' clips and unnamed/unrecognised clips on Seq tracks produce no PAD event.
+    whose arrangement span **overlaps** a section → PAD ON at (seq_index N-1, silayer = layer).
+    Overlap uses CurrentStart/CurrentEnd so layers that continue across a locator still fire
+    in later sections. 'Keep' clips and unnamed clips produce no PAD event.
 
-    pad_conds format: {(pad_idx, silayer): cond}  — cond=1 for ON.
+    pad_conds format: {(seq_index, silayer): cond}  — cond=1 for ON (used with pad_events by index).
     """
     empty = [{'pad_conds': {}} for _ in locators]
     if not locators or midi_tracks is None:
@@ -3531,13 +3560,15 @@ def extract_pad_sections(tracks, pad_list, locators, tolerance_beats=0.1,
                 continue
             layer_idx = action[1]
 
-            sec_idx = _section_for_start(start_time, locators)
-            if sec_idx < 0:
-                continue
-
-            result[sec_idx]['pad_conds'][(seq_index, layer_idx)] = 1
-            logger.debug(f'  Song: Seq{seq_index+1} clip "{clip_name}" starts in section {sec_idx} '
-                         f'→ PAD ON chan={seq_index} silayer={layer_idx}')
+            end_time = _clip_end_time(clip)
+            if end_time is None:
+                end_time = start_time + 1e-6
+            for sec_idx in _sections_overlapping_range(start_time, end_time, locators):
+                result[sec_idx]['pad_conds'][(seq_index, layer_idx)] = 1
+                logger.debug(
+                    f'  Song: Seq{seq_index+1} clip "{clip_name}" [{start_time:g},{end_time:g}) '
+                    f'→ PAD ON section {sec_idx} silayer={layer_idx}'
+                )
 
     return result
 
@@ -3608,16 +3639,20 @@ def extract_seq_sections(midi_tracks, locators, midi_track_info=None, tolerance_
         name_el = find_element_by_tag(clip, 'Name')
         clip_name = name_el.attrib.get('Value', '') if name_el is not None else ''
 
-        sec_idx = _section_for_start(start_time, locators)
-        if sec_idx < 0:
+        end_time = _clip_end_time(clip)
+        if end_time is None:
+            end_time = start_time + 1e-6
+        sec_indices = _sections_overlapping_range(start_time, end_time, locators)
+        if not sec_indices:
             continue
 
         # Keep-named clips → SEQ Keep events for each number N in the name
         keep_seqs = parse_keep_pads_from_name(clip_name)  # returns set of 0-based indices
         if keep_seqs:
-            for seq_idx in keep_seqs:
-                result[sec_idx]['seq_conds'][(seq_idx, 0)] = 2
-                logger.debug(f'  Song: Pads clip "{clip_name}" → SEQ Keep chan={256+seq_idx}')
+            for sec_idx in sec_indices:
+                for seq_idx in keep_seqs:
+                    result[sec_idx]['seq_conds'][(seq_idx, 0)] = 2
+                    logger.debug(f'  Song: Pads clip "{clip_name}" → SEQ Keep chan={256+seq_idx} sec={sec_idx}')
             continue
 
         # Unnamed / layer-named clips → SEQ ON events from MIDI note keys
@@ -3634,8 +3669,9 @@ def extract_seq_sections(midi_tracks, locators, midi_track_info=None, tolerance_
                     continue
                 seq_idx = midi_key - 36  # note 36 = seq_index 0 (Seq1), 37 = 1, …
                 if 0 <= seq_idx <= 15:
-                    result[sec_idx]['seq_conds'][(seq_idx, 0)] = 1
-                    logger.debug(f'  Song: Pads clip key={midi_key} → SEQ ON chan={256+seq_idx}')
+                    for sec_idx in sec_indices:
+                        result[sec_idx]['seq_conds'][(seq_idx, 0)] = 1
+                        logger.debug(f'  Song: Pads clip key={midi_key} → SEQ ON chan={256+seq_idx} sec={sec_idx}')
 
     return result
 
