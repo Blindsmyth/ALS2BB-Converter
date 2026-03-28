@@ -1380,6 +1380,46 @@ def row_column(pad):
     column = rc[1]
     return (row, column)
 
+def _project_label_from_input_path(input_path):
+    """
+    Derive a human project label from the input ALS path.
+    Example:
+      ".../Connection Error Blackbox Project/Connection Error Blackbox Song Mode.als"
+      -> "Connection Error"
+    """
+    if not input_path:
+        return ''
+
+    parent_name = os.path.basename(os.path.dirname(input_path)).strip()
+    if parent_name:
+        parent_name = re.sub(r'\s+Blackbox\s+Project$', '', parent_name, flags=re.IGNORECASE).strip()
+        if parent_name:
+            return parent_name
+
+    base = os.path.splitext(os.path.basename(input_path))[0].strip()
+    if not base:
+        return ''
+    base = re.sub(r'\s+Blackbox(\s+Song\s+Mode)?(\s+no\s+group)?$', '', base, flags=re.IGNORECASE).strip()
+    return base
+
+
+def _append_project_suffix(filename, project_label):
+    """Append [Project Name] before extension for exported sample files."""
+    if not filename or not project_label:
+        return filename
+
+    safe_label = re.sub(r'[\\/:*?"<>|]', '_', project_label).strip()
+    if not safe_label:
+        return filename
+
+    stem, ext = os.path.splitext(filename)
+    if not ext:
+        ext = '.wav'
+    if stem.endswith(f'[{safe_label}]'):
+        return stem + ext
+    return f'{stem}[{safe_label}]{ext}'
+
+
 def pad_dicter(row, column, filename, type):
     cell_dict = {'row':str(row), 'column':str(column), 'layer':"0", 'filename':filename, 'type':type}
     return(cell_dict)
@@ -1399,7 +1439,7 @@ def pad_params_dicter(envattack, envdecay, envsus, envrel, samstart, samlen, mul
                     'recquant': '3', 'recinput': '0', 'recinputmulti': '0', 'recusethres': '0', 'recthresh': '-20000', 'recmonoutbus': '0'}
     return(params_dict)
 
-def make_drum_rack_pads(session, pad_list, tempo):
+def make_drum_rack_pads(session, pad_list, tempo, project_label=''):
     """
     Create Blackbox pads from Drum Rack pad list.
     Each pad in pad_list contains: {'blackbox_pad': 0-15, 'simpler': device, 'choke_group': 0-16, ...}
@@ -1444,6 +1484,8 @@ def make_drum_rack_pads(session, pad_list, tempo):
                     sample_filename = safe_name + ext
                 else:
                     sample_filename = original_filename
+
+                sample_filename = _append_project_suffix(sample_filename, project_label)
                 
                 logger.info(f'  Pad {pad_num}: {sample_filename} (source: {original_filename})')
                 
@@ -2038,6 +2080,177 @@ def _midi_clip_signature(midi_clip):
     return (len(notes_list), length_beats, notes_list)
 
 
+def _max_note_span_in_clip(midi_clip):
+    """Max (Time + Duration) over all MidiNoteEvents in clip, in ALS time units."""
+    max_end = 0.0
+    notes_elem = find_element_by_tag(midi_clip, 'Notes')
+    if notes_elem is None:
+        return 0.0
+    key_tracks = find_element_by_tag(notes_elem, 'KeyTracks')
+    if key_tracks is None:
+        return 0.0
+    for key_track in key_tracks:
+        notes_container = find_element_by_tag(key_track, 'Notes')
+        if notes_container is None:
+            continue
+        for note_event in notes_container:
+            if 'Time' not in note_event.attrib:
+                continue
+            try:
+                t = float(note_event.attrib.get('Time', 0))
+                d = float(note_event.attrib.get('Duration', 0))
+            except (ValueError, TypeError):
+                continue
+            max_end = max(max_end, t + d)
+    return max_end
+
+
+def _clip_length_beats_from_midi_clip(midi_clip):
+    """
+    Convert ALS clip loop / arrangement bounds to sequence length in beats.
+
+    Do not use raw MIDI note Duration here for output length: step_count uses this value;
+    long-held notes in clips are not reliable indicators of loop length.
+
+    Older code used (LoopEnd-LoopStart)/2 and (CurrentEnd-CurrentStart)/2 everywhere.
+    That matches some Live exports where values are in 'raw' units, but **halves**
+    beat-native clips (e.g. Hack Into Your Soul: loop 0–4 = 4 beats, notes at 0–3 beats).
+    Other projects use integer spans where legacy /32 applies (Connection Error style).
+
+    Arrangement vs notes (loop off): when play_range > note_max * ARR_NOTE_REPEAT_RATIO + eps
+    (1.5×), clip_length_beats = play_range — the timeline block is the musical length for a
+    repeated/extended clip slot.
+
+    See docs/SEQUENCE_TIMING_WORKFLOW.md for step_count usage of this length.
+    """
+    if midi_clip is None:
+        return 1.0
+
+    eps = 0.05
+    rel_tol = 0.02
+    # Loop off: if arrangement block is much longer than note span, treat timeline as beats (see below).
+    ARR_NOTE_REPEAT_RATIO = 1.5
+
+    current_start_elem = find_element_by_tag(midi_clip, 'CurrentStart')
+    current_end_elem = find_element_by_tag(midi_clip, 'CurrentEnd')
+    play_range = 0.0
+    if current_start_elem is not None and 'Value' in current_start_elem.attrib and \
+       current_end_elem is not None and 'Value' in current_end_elem.attrib:
+        try:
+            play_range = float(current_end_elem.attrib['Value']) - float(current_start_elem.attrib['Value'])
+        except (ValueError, TypeError):
+            play_range = 0.0
+
+    note_max = _max_note_span_in_clip(midi_clip)
+
+    loop_elem = find_element_by_tag(midi_clip, 'Loop')
+    loop_on = False
+    loop_span = 0.0
+    if loop_elem is not None:
+        loop_on_elem = find_element_by_tag(loop_elem, 'LoopOn')
+        if loop_on_elem is not None and 'Value' in loop_on_elem.attrib:
+            v = str(loop_on_elem.attrib['Value']).strip().lower()
+            loop_on = v in ('1', 'true', 'on')
+        ls_el = find_element_by_tag(loop_elem, 'LoopStart')
+        le_el = find_element_by_tag(loop_elem, 'LoopEnd')
+        if ls_el is not None and 'Value' in ls_el.attrib and le_el is not None and 'Value' in le_el.attrib:
+            try:
+                loop_span = float(le_el.attrib['Value']) - float(ls_el.attrib['Value'])
+            except (ValueError, TypeError):
+                loop_span = 0.0
+
+    # --- Loop on: loop brace defines repeating region ---
+    if loop_on and loop_span > 0:
+        # Large integer loop matching note span (legacy)
+        if loop_span >= 32 and note_max >= 32 and abs(loop_span - note_max) <= eps * max(loop_span, 32.0):
+            # Live uses different scalings: 128→4 beats (/32) vs 64→4 beats (/16) for same bar count.
+            beats = (loop_span / 32.0) if loop_span >= 128 else (loop_span / 16.0)
+            logger.debug(f'Clip length: legacy loop span={loop_span} note_max={note_max} -> {beats} beats (legacy /32 or /16)')
+            return max(1.0, min(beats, 256.0))
+        # Beat-native: short loop with non-integer note extent (e.g. 4-bar loop, notes 0–3.25)
+        if loop_span <= 64 and note_max <= 64 and (
+            abs(loop_span - note_max) > 0.1 or abs(note_max - round(note_max)) > 1e-5
+        ):
+            logger.debug(f'Clip length: beat-native loop span={loop_span} note_max={note_max} -> {loop_span} beats')
+            return max(1.0, min(loop_span, 256.0))
+        # Small matching integer loop (legacy raw)
+        if loop_span <= 32 and note_max <= 32 and abs(loop_span - note_max) < eps + 1e-6:
+            beats = loop_span / 2.0
+            logger.debug(f'Clip length: small legacy loop span={loop_span} -> {beats} beats (/2)')
+            return max(1.0, min(beats, 256.0))
+        if loop_span <= 64 and note_max <= 64:
+            logger.debug(f'Clip length: short loop span={loop_span} note_max={note_max} -> {loop_span} beats')
+            return max(1.0, min(loop_span, 256.0))
+        beats = loop_span / 2.0
+        logger.debug(f'Clip length: loop fallback span={loop_span} -> {beats} beats (/2)')
+        return max(1.0, min(beats, 256.0))
+
+    # --- Loop off: arrangement extent ---
+    if not loop_on and play_range > 0:
+        # Empty MIDI (layer placeholder / audio-only): timeline is already in beats in Live 11+.
+        # Applying /2 wrongly halves (e.g. Seq13B 80→40 beats, Seq16B 244→122 beats).
+        if note_max < eps:
+            pr = max(1.0, min(play_range, 256.0))
+            # Long arrangement blocks with no MIDI are usually timeline gaps (session template or muted
+            # lane), e.g. Seq15 B spanning to the next locator — not a 128-beat sequence to export.
+            if pr >= 96:
+                logger.debug(
+                    f'Clip length: no MIDI notes play_range={pr} -> 4 beats (cap long empty block)'
+                )
+                return 4.0
+            logger.debug(f'Clip length: no MIDI notes play_range={pr} -> {pr} beats (arrangement)')
+            return pr
+        # Arrangement longer than note content (repeated / extended clip on timeline)
+        #
+        # Definitions (loop off, this MidiClip only):
+        #   play_range = CurrentEnd − CurrentStart (arrangement span of this clip instance)
+        #   note_max   = max over notes of (Time + Duration) in ALS units
+        #
+        # Condition: note_max > 0 AND play_range > note_max * ARR_NOTE_REPEAT_RATIO + eps
+        #   ARR_NOTE_REPEAT_RATIO = 1.5 (plus eps=0.05 so tiny float noise doesn’t flip the branch)
+        #
+        # Meaning: the MIDI in the clip does not fill the whole timeline slot. In Live that usually
+        # means the clip’s material is shorter than the block you drew on the arrangement (e.g. the
+        # same pattern looped for many bars, or a short pattern in a long clip region). For Blackbox,
+        # we want the **full arrangement block length** as the sequence length in **beats**, so we set
+        # clip_length_beats = play_range (capped at 256 beats), not note_max and not play_range/2.
+        #
+        # Example: note_max = 64, play_range = 192 → use 192 beats (not 64, not 96).
+        if note_max > 0 and play_range > note_max * ARR_NOTE_REPEAT_RATIO + eps:
+            logger.debug(f'Clip length: arrangement repeat play_range={play_range} note_max={note_max} -> {play_range} beats')
+            return max(1.0, min(play_range, 256.0))
+        # Timeline in beats, MIDI durations in 16th-note units (e.g. 4 beats vs 64)
+        if play_range <= 32 and note_max > play_range * 8 - eps and \
+           abs(note_max - play_range * 16) < eps * max(note_max, 1.0):
+            logger.debug(f'Clip length: beat timeline vs 16ths play={play_range} note_max={note_max} -> {play_range} beats')
+            return max(1.0, min(play_range, 256.0))
+        # Note span ~2× timeline (storage quirk)
+        if note_max > play_range * 1.2 + eps and abs(note_max - 2.0 * play_range) < 1.0 + eps:
+            beats = note_max / 2.0
+            logger.debug(f'Clip length: 2× timeline play={play_range} note_max={note_max} -> {beats} beats')
+            return max(1.0, min(beats, 256.0))
+        # Legacy: arrangement span matches note span (integer ALS timeline)
+        if note_max > 0 and abs(play_range - note_max) <= rel_tol * max(play_range, note_max) + eps:
+            if play_range >= 128:
+                beats = play_range / 32.0
+                logger.debug(f'Clip length: legacy match play={play_range} -> {beats} beats (/32)')
+            elif play_range >= 32:
+                beats = play_range / 16.0
+                logger.debug(f'Clip length: legacy match play={play_range} -> {beats} beats (/16)')
+            else:
+                beats = play_range / 2.0
+                logger.debug(f'Clip length: legacy match play={play_range} -> {beats} beats (/2)')
+            return max(1.0, min(beats, 256.0))
+        beats = play_range / 2.0
+        logger.debug(f'Clip length: arrangement fallback play_range={play_range} -> {beats} beats (/2)')
+        return max(1.0, min(beats, 256.0))
+
+    if play_range > 0:
+        beats = play_range / 2.0
+        return max(1.0, min(beats, 256.0))
+    return 1.0
+
+
 def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=None, unquantised=False, expected_seq_params=None):
     """
     Create Blackbox sequences from MIDI tracks using firmware 2.3+ format.
@@ -2365,94 +2578,19 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                                     }
                                     sublayer_events.append(event_dict)
             
-            # Extract clip length from MIDI clip to calculate step_count.
-            # Use length_clip (session when it matches arrangement) – session has the source loop length.
-            # PRIORITY: LoopStart/LoopEnd first – for a looping clip, the loop region defines the
-            # actual sequence length (e.g. 2-bar loop). CurrentStart/CurrentEnd spans placement extent,
-            # which can be the whole arrangement – that would wrongly give 128 steps for a 2-bar loop.
-            clip_length_beats = 1.0  # Default to 1 beat
+            # Extract clip length from MIDI clip to calculate step_count (see _clip_length_beats_from_midi_clip).
+            clip_length_beats = 1.0
             clip_for_length = length_clip if length_clip is not None else midi_clip
-            current_start_elem = find_element_by_tag(clip_for_length, 'CurrentStart') if clip_for_length else None
-            current_end_elem = find_element_by_tag(clip_for_length, 'CurrentEnd') if clip_for_length else None
             if clip_for_length:
-                # Method 1: LoopStart/LoopEnd ONLY when LoopOn=true.
-                # In ALS, LoopStart/LoopEnd are always present in the XML even when looping is disabled.
-                # When LoopOn=false, the loop region is irrelevant — the clip plays its full
-                # CurrentStart→CurrentEnd range, NOT the loop region. Using loop points when LoopOn=false
-                # produces wrong lengths (e.g. a 2-bar loop region on a 16-bar clip gives 2 bars, not 16).
-                # DO NOT remove the LoopOn check below — it has been removed by mistake multiple times.
-                loop_elem = find_element_by_tag(clip_for_length, 'Loop')
-                loop_on = False
-                if loop_elem is not None:
-                    loop_on_elem = find_element_by_tag(loop_elem, 'LoopOn')
-                    if loop_on_elem is not None and 'Value' in loop_on_elem.attrib:
-                        v = str(loop_on_elem.attrib['Value']).strip().lower()
-                        loop_on = v in ('1', 'true', 'on')
-                if loop_on and loop_elem is not None:  # intentional gate — see comment above
-                    loop_start_elem = find_element_by_tag(loop_elem, 'LoopStart')
-                    loop_end_elem = find_element_by_tag(loop_elem, 'LoopEnd')
-                    if loop_start_elem is not None and 'Value' in loop_start_elem.attrib and \
-                       loop_end_elem is not None and 'Value' in loop_end_elem.attrib:
-                        try:
-                            loop_start = float(loop_start_elem.attrib['Value'])
-                            loop_end = float(loop_end_elem.attrib['Value'])
-                            loop_len_raw = loop_end - loop_start
-                            # LoopStart/LoopEnd use same raw format as CurrentStart/CurrentEnd: raw/8=bars, bars*4=beats, so raw/2=beats
-                            if loop_len_raw > 0 and loop_len_raw <= 2048.0:
-                                clip_length_beats = loop_len_raw / 2.0
-                                if clip_length_beats <= 256.0:
-                                    logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length from LoopStart/LoopEnd (loop on): raw={loop_len_raw} -> {clip_length_beats} beats')
-                        except (ValueError, TypeError) as e:
-                            logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Error LoopStart/LoopEnd: {e}')
-                else:
-                    logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Loop off, not using LoopStart/LoopEnd for length')
-                # Method 2: Clip End - Clip Start (used when Method 1 does not fire, i.e. LoopOn=false).
-                # CurrentStart/CurrentEnd use the same raw time unit as LoopStart/LoopEnd: raw ÷ 2 = beats.
-                # Do NOT override this value with note-derived lengths — clip length always wins.
-                if clip_length_beats <= 1.0 and current_start_elem is not None and 'Value' in current_start_elem.attrib and \
-                   current_end_elem is not None and 'Value' in current_end_elem.attrib:
-                    try:
-                        cs = float(current_start_elem.attrib['Value'])
-                        ce = float(current_end_elem.attrib['Value'])
-                        play_range = ce - cs
-                        if play_range > 0 and play_range <= 2048.0:
-                            clip_length_beats = play_range / 2.0
-                            if clip_length_beats <= 256.0:
-                                logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length from CurrentEnd-CurrentStart: raw={play_range} -> {clip_length_beats} beats')
-                    except (ValueError, TypeError) as e:
-                        logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Error CurrentStart/CurrentEnd: {e}')
-                
-                # Method 3: Derive from note positions when we have notes (and no length yet)
-                if clip_length_beats <= 1.0 and len(sublayer_events) > 0:
-                    max_time = 0.0
-                    for event in sublayer_events:
-                        note_start_beats = event.get('time_val', 0)
-                        note_duration_beats = event.get('dur_val', 0)
-                        note_end_beats = note_start_beats + note_duration_beats
-                        max_time = max(max_time, note_end_beats)
-                    if max_time > 0:
-                        clip_length_beats = int((max_time + 3) // 4) * 4
-                        if clip_length_beats < 4:
-                            clip_length_beats = max(4.0, max_time)
-                        logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length from notes = {clip_length_beats} beats (max note end: {max_time:.3f})')
-                
-                # Method 4: CurrentEnd alone (fallback). Reject large values (likely time in sec).
-                if clip_length_beats <= 1.0:
-                    ce_elem = current_end_elem if current_end_elem is not None else find_element_by_tag(midi_clip, 'CurrentEnd')
-                    if ce_elem is not None and 'Value' in ce_elem.attrib:
-                        try:
-                            current_end_val = float(ce_elem.attrib['Value'])
-                            if 0 < current_end_val <= 256.0:
-                                clip_length_beats = current_end_val
-                                logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Clip length from CurrentEnd = {clip_length_beats} beats')
-                            elif current_end_val > 256.0:
-                                logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: CurrentEnd={current_end_val} too large, ignoring')
-                        except (ValueError, TypeError):
-                            pass
-                
-                if clip_length_beats <= 1.0:
-                    logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Using default clip length = 1.0 beat')
-                    clip_length_beats = 1.0
+                clip_length_beats = _clip_length_beats_from_midi_clip(clip_for_length)
+                logger.info(
+                    f'    Sub-layer {chr(65+sublayer_idx)}: clip_length_beats={clip_length_beats:.2f} '
+                    f'(_clip_length_beats_from_midi_clip)'
+                )
+
+            # Sequence length (step_count) follows clip / arrangement / loop bounds only — not MIDI
+            # note Duration. Long notes in the ALS often span loop cycles or full clip storage while
+            # the audible loop is shorter (e.g. Seq15); using max note end wrongly blows up step_count.
 
             # Extend short note durations: when notes visually fill the clip but XML has short durations,
             # extend each note to reach the next note (or clip end). Only lengthen, never shorten.
@@ -2474,6 +2612,21 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                     if target_dur > dur_val and target_dur > 0:
                         event['dur_val'] = target_dur
                         logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: Extended note at {time_val:.2f} from {dur_val:.2f} to {target_dur:.2f} beats')
+            
+            # ALS Duration often spans the whole clip on disk while clip_length_beats is the loop /
+            # arrangement window (Seq15 A). lencount is derived from dur_val — clamp so gates fit the
+            # exported pattern (seq length follows clip bounds; note tail must not exceed that).
+            if sublayer_events and clip_length_beats > 0:
+                for event in sublayer_events:
+                    tv = float(event.get('time_val', 0))
+                    dv = float(event.get('dur_val', 0))
+                    max_dur = max(0.0, float(clip_length_beats) - tv)
+                    if dv > max_dur + 1e-4:
+                        logger.debug(
+                            f'    Sub-layer {chr(65+sublayer_idx)}: Clamp note dur {dv:.3f} -> {max_dur:.3f} '
+                            f'beats (clip_length={clip_length_beats:.3f})'
+                        )
+                        event['dur_val'] = max_dur
             
             # Sanity cap only when clip_length came from CurrentEnd (unreliable - can be time in sec).
             # LoopStart/LoopEnd and note-derived lengths are trusted; allow up to 256 beats (64 bars).
@@ -2963,12 +3116,17 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
                         'step': '0', 'chan': str(chan_val), 'type': 'sceneitem',
                         'silayer': str(layer_idx), 'cond': str(cond),
                     })
-            # Silayer 4 block: scene (no chan) cond 2, chan 256 cond 0, chan 15 silayer 4 cond 0
+            # Seq 1 (chan 256): four layers from Pads track data, then silayer-4 scene row.
+            # Emit 256 *before* silayer 4 and use cond=0 on silayer 4 (not 2) — matches hardware
+            # testing / corrected presets; old order + cond=2 caused first-hit and Keep glitches.
+            for layer_idx in range(4):
+                cond = int(_seq_conds.get((0, layer_idx), 0))
+                ET.SubElement(sequence, 'seqevent', attrib={
+                    'step': '0', 'chan': '256', 'type': 'sceneitem',
+                    'silayer': str(layer_idx), 'cond': str(cond),
+                })
             ET.SubElement(sequence, 'seqevent', attrib={
-                'step': '0', 'type': 'sceneitem', 'silayer': '4', 'cond': '2',
-            })
-            ET.SubElement(sequence, 'seqevent', attrib={
-                'step': '0', 'chan': '256', 'type': 'sceneitem', 'silayer': '0', 'cond': '0',
+                'step': '0', 'type': 'sceneitem', 'silayer': '4', 'cond': '0',
             })
             if pad_end == 14:
                 ET.SubElement(sequence, 'seqevent', attrib={
@@ -3705,7 +3863,10 @@ def main(args):
         session.attrib = {'version': '2'}
         
         # Create pads from drum rack
-        session, assets = make_drum_rack_pads(session, pad_list, tempo)
+        project_label = _project_label_from_input_path(args.Input)
+        if project_label:
+            logger.info(f'Using project label for sample names: [{project_label}]')
+        session, assets = make_drum_rack_pads(session, pad_list, tempo, project_label=project_label)
         
         # Create sequences from MIDI tracks
         expected_seq_params = _load_expected_sequence_params(args.compare) if getattr(args, 'compare', None) else None
