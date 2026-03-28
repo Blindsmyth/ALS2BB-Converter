@@ -2224,13 +2224,6 @@ def _clip_length_beats_from_midi_clip(midi_clip, extracted_note_count=0):
                     f'play_range={pr} beats (arrangement)'
                 )
                 return pr
-            # Long arrangement blocks with no MIDI are usually timeline gaps (session template or muted
-            # lane), e.g. Seq15 B spanning to the next locator — not a 128-beat sequence to export.
-            if pr >= 96:
-                logger.debug(
-                    f'Clip length: no MIDI notes play_range={pr} -> 4 beats (cap long empty block)'
-                )
-                return 4.0
             logger.debug(f'Clip length: no MIDI notes play_range={pr} -> {pr} beats (arrangement)')
             return pr
         # Arrangement longer than note content (repeated / extended clip on timeline)
