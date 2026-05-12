@@ -3174,6 +3174,26 @@ def make_song(root):
     return root
 
 
+def _song_section_pad_tail_order(armed_pad_indices):
+    """
+    Order for pad sceneitems emitted *after* the seq chan block (257–271, 256).
+
+    Hand-tuned Frozen_Git presets (e.g. 0Frozen_Gitv8f3c31fFIXEDD) defer armed pads
+    to the tail so song mode arms sequences correctly. Ordering matches that reference:
+    - If pads 0,1,2 are all armed: 0,1,2 then remaining ascending.
+    - Else: pads >= 12 descending, then pads < 12 ascending (e.g. 12,0,1 for Intro).
+    """
+    armed = sorted(set(int(i) for i in armed_pad_indices))
+    if not armed:
+        return []
+    if {0, 1, 2}.issubset(set(armed)):
+        rest = sorted(x for x in armed if x not in (0, 1, 2))
+        return [0, 1, 2] + rest
+    high = [x for x in armed if x >= 12]
+    low = [x for x in armed if x < 12]
+    return sorted(high, reverse=True) + sorted(low)
+
+
 def make_song_from_sections(root, sections, pad_list, midi_tracks):
     """
     Create Blackbox song sections (layer 2 cells). REFERENCE: preset_expected0403.xml.
@@ -3272,6 +3292,7 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
                     )
 
         # Pads: "1 Beat" omits pad 15 from the main pad block and emits it on silayer 4 (legacy preset).
+        armed_tail = []
         if sec_name == '1 Beat':
             pad_end = 14
             for pad_idx in range(1, pad_end + 1):
@@ -3285,10 +3306,13 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
                 })
         else:
             for pad_idx, silayer, cond in pad_events:
-                attrs = {'step': '0', 'type': 'sceneitem', 'silayer': str(silayer), 'cond': str(cond)}
-                if pad_idx != 0:
-                    attrs['chan'] = str(pad_idx)
-                ET.SubElement(sequence, 'seqevent', attrib=attrs)
+                if int(cond) < 1:
+                    attrs = {'step': '0', 'type': 'sceneitem', 'silayer': str(silayer), 'cond': str(cond)}
+                    if pad_idx != 0:
+                        attrs['chan'] = str(pad_idx)
+                    ET.SubElement(sequence, 'seqevent', attrib=attrs)
+                else:
+                    armed_tail.append((pad_idx, silayer, cond))
 
         # Seq channels: always 257–271 then 256, then silayer-4 terminator — same order in every
         # section so song advance does not reorder scene application (avoids playhead glitches).
@@ -3306,9 +3330,22 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
                 'step': '0', 'chan': '256', 'type': 'sceneitem',
                 'silayer': str(layer_idx), 'cond': str(cond),
             })
-        ET.SubElement(sequence, 'seqevent', attrib={
-            'step': '0', 'type': 'sceneitem', 'silayer': '4', 'cond': '0',
-        })
+        # Armed pads *after* seq block (Pads mode song sections): matches hardware-tested presets;
+        # avoids extra silayer-4 row before these arms (see 1 Intro Loop in FIXEDD).
+        if sec_name != '1 Beat' and armed_tail:
+            tail_map = {p: (sl, c) for p, sl, c in armed_tail}
+            for pad_idx in _song_section_pad_tail_order(tail_map.keys()):
+                silayer, cond = tail_map[pad_idx]
+                attrs = {'step': '0', 'type': 'sceneitem', 'silayer': str(silayer), 'cond': str(cond)}
+                if pad_idx != 0:
+                    attrs['chan'] = str(pad_idx)
+                ET.SubElement(sequence, 'seqevent', attrib=attrs)
+        has_s4_pad = any(
+            int(extracted_pad_conds.get((i, 4), 0) or 0) >= 1 for i in range(num_pads))
+        if sec_name == '1 Beat' or has_s4_pad:
+            ET.SubElement(sequence, 'seqevent', attrib={
+                'step': '0', 'type': 'sceneitem', 'silayer': '4', 'cond': '0',
+            })
         if sec_name == '1 Beat':
             ET.SubElement(sequence, 'seqevent', attrib={
                 'step': '0', 'chan': '15', 'type': 'sceneitem', 'silayer': '4', 'cond': '0',
@@ -4093,31 +4130,17 @@ def extract_seq_sections(midi_tracks, locators, midi_track_info=None, tolerance_
 
     result = [{'seq_conds': {}} for _ in locators]
 
-    for clip in _get_arrangement_clips(pads_track):
-        start_time = _clip_start_time(clip)
-        if start_time is None:
-            continue
-
-        name_el = find_element_by_tag(clip, 'Name')
-        clip_name = name_el.attrib.get('Value', '') if name_el is not None else ''
-
-        end_time = _clip_end_time(clip)
-        if end_time is None:
-            end_time = start_time + 1e-6
-        sec_indices = _sections_overlapping_range(start_time, end_time, locators)
+    def _apply_pads_clip_seq_to_sections(clip, clip_name, sec_indices):
+        """Write Keep / MIDI key seq_conds for each section index in sec_indices."""
         if not sec_indices:
-            continue
-
-        # Keep-named clips → SEQ Keep events for each number N in the name
+            return
         keep_seqs = parse_keep_pads_from_name(clip_name)  # returns set of 0-based indices
         if keep_seqs:
             for sec_idx in sec_indices:
                 for seq_idx in keep_seqs:
                     result[sec_idx]['seq_conds'][(seq_idx, 0)] = 2
                     logger.debug(f'  Song: Pads clip "{clip_name}" → SEQ Keep chan={256+seq_idx} sec={sec_idx}')
-            continue
-
-        # Unnamed / layer-named clips → SEQ ON events from MIDI note keys
+            return
         notes_elem = find_element_by_tag(clip, 'Notes')
         key_tracks_el = find_element_by_tag(notes_elem, 'KeyTracks') if notes_elem is not None else None
         if key_tracks_el is not None:
@@ -4134,6 +4157,63 @@ def extract_seq_sections(midi_tracks, locators, midi_track_info=None, tolerance_
                     for sec_idx in sec_indices:
                         result[sec_idx]['seq_conds'][(seq_idx, 0)] = 1
                         logger.debug(f'  Song: Pads clip key={midi_key} → SEQ ON chan={256+seq_idx} sec={sec_idx}')
+
+    for clip in _get_arrangement_clips(pads_track):
+        start_time = _clip_start_time(clip)
+        if start_time is None:
+            continue
+
+        name_el = find_element_by_tag(clip, 'Name')
+        clip_name = name_el.attrib.get('Value', '') if name_el is not None else ''
+
+        end_time = _clip_end_time(clip)
+        if end_time is None:
+            end_time = start_time + 1e-6
+        sec_indices = _sections_overlapping_range(start_time, end_time, locators)
+        if not sec_indices:
+            continue
+        _apply_pads_clip_seq_to_sections(clip, clip_name, sec_indices)
+
+    # Pads clips that start exactly on locator B are assigned to the *next* section only
+    # by half-open overlap [A,B). Long sections with no overlapping Pads clip (e.g. "Bass Full"
+    # with the next section's Keep starting at B) would then have an empty seq block and seqs
+    # stay silent until the next section — wrong on hardware. Copy that boundary-starting clip's
+    # seq into the *previous* section when that section is still seq-empty and long enough that
+    # this isn't the common short "intro → first hit" case (where the next section already gets
+    # the same clip from normal overlap once you enter it).
+    min_prev_sec_len_for_boundary_seq = 64.0  # beats
+    for sec_idx in range(len(locators) - 1):
+        if result[sec_idx]['seq_conds']:
+            continue
+        try:
+            sec_start = float(locators[sec_idx]['time'])
+            boundary = float(locators[sec_idx + 1]['time'])
+        except (TypeError, ValueError):
+            continue
+        if boundary - sec_start < min_prev_sec_len_for_boundary_seq - 1e-9:
+            continue
+        for clip in _get_arrangement_clips(pads_track):
+            st = _clip_start_time(clip)
+            if st is None:
+                continue
+            if abs(float(st) - boundary) > tolerance_beats:
+                continue
+            name_el = find_element_by_tag(clip, 'Name')
+            clip_name = name_el.attrib.get('Value', '') if name_el is not None else ''
+            # #region agent log
+            _dbg(
+                'xml_read.py:extract_seq_sections boundary_seq',
+                'Applying Pads clip at locator boundary to previous section seq_conds',
+                {
+                    'prev_sec_idx': sec_idx,
+                    'prev_sec_name': locators[sec_idx].get('name'),
+                    'boundary_beat': boundary,
+                    'clip_name': clip_name,
+                },
+                hypothesis='H_seq_boundary',
+            )
+            # #endregion
+            _apply_pads_clip_seq_to_sections(clip, clip_name, [sec_idx])
 
     return result
 
