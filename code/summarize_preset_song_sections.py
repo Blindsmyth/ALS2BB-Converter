@@ -5,12 +5,11 @@ comparison to a spreadsheet (e.g. 8X4 = 8 bars per pass × section repeats 4).
 
 Repeats: from section cell <params sectionrepeats="N"> (locator play count in the ALS).
 
-Bars (one pass), matching Blackbox-style “longest pattern driving this section”:
+Bars (one pass) — only **scene ON** (`cond=1`) counts toward length. **Keep** (`cond=2`)
+carries prior state; it should not dominate the readout (e.g. **transition**: one pad ON at
+layer B is 2 bars while bass Seq Keeps would otherwise read 8).
 
-  • **Scene arms** (pads or seq channels): each sceneitem with `cond` 1 or 2 contributes
-    `(grid_slot, silayer)`. **silayer** selects the `noteseq` sublayer on that slot (same as
-    firmware). Seq Keep on e.g. chan 268 with `silayer="0"` reads only sublayer 0, not the
-    longest pattern on other sublayers of that slot.
+  • **Pad or seq** `chan`: use that line’s `silayer` with `notestepcount` / `notesteplen`.
 
 Section **bar length** from the Live timeline alone is not stored in `preset.xml`; if bars
 still disagree with your sheet (e.g. break = 16 vs longest pad pattern = 8), pass a future
@@ -126,12 +125,7 @@ def _max_bars_at_pad_silayer(
 
 def _armed_grid_layers_from_section(seq_el: ET.Element | None) -> set[tuple[int, int]]:
     """
-    (grid_slot 0–15, silayer 0–3) for every pad or seq scene ON/Keep.
-
-    Pad events: chan omitted → slot 0; chan 0–15 → that pad index.
-    Seq events: chan 256–271 → slot (chan - 256).
-
-    silayer selects which seqsublayer / pattern (A–D) applies.
+    (grid_slot 0–15, silayer) for every pad or seq scene ON/Keep (debug; includes cond=2).
     """
     armed: set[tuple[int, int]] = set()
     if seq_el is None:
@@ -141,6 +135,37 @@ def _armed_grid_layers_from_section(seq_el: ET.Element | None) -> set[tuple[int,
             continue
         cond = ev.get("cond", "0")
         if cond not in ("1", "2"):
+            continue
+        try:
+            silayer = int(ev.get("silayer", "0") or 0)
+        except ValueError:
+            silayer = 0
+        if not (0 <= silayer <= 3):
+            silayer = 0
+        ch = ev.get("chan")
+        if ch is None or ch == "":
+            armed.add((0, silayer))
+            continue
+        try:
+            ci = int(ch)
+        except ValueError:
+            continue
+        if 0 <= ci <= 15:
+            armed.add((ci, silayer))
+        elif 256 <= ci <= 271:
+            armed.add((ci - 256, silayer))
+    return armed
+
+
+def _armed_on_layers_for_bars(seq_el: ET.Element | None) -> set[tuple[int, int]]:
+    """Grid (slot, silayer) for scene ON only — used for bars×repeats bar count."""
+    armed: set[tuple[int, int]] = set()
+    if seq_el is None:
+        return armed
+    for ev in seq_el.findall("seqevent"):
+        if ev.get("type") != "sceneitem":
+            continue
+        if ev.get("cond", "0") != "1":
             continue
         try:
             silayer = int(ev.get("silayer", "0") or 0)
@@ -209,7 +234,7 @@ def _sections_report(root: ET.Element) -> list[dict]:
         seq = cell.find("sequence")
         armed_layers = _armed_grid_layers_from_section(seq)
         max_bars = 0.0
-        for grid_slot, sl in armed_layers:
+        for grid_slot, sl in _armed_on_layers_for_bars(seq):
             max_bars = max(max_bars, _max_bars_at_pad_silayer(grid_slot, sl, noteseq_index))
         # Integer bars for display when close to whole bars
         bars_disp = int(round(max_bars)) if abs(max_bars - round(max_bars)) < 0.05 else round(max_bars, 2)
@@ -235,7 +260,7 @@ def _should_skip_row(r: dict) -> bool:
 def _print_report(path: str, rep: list[dict]) -> None:
     print(f"# {path}")
     print(
-        "row\tname\tbars\trepeats\tbarsXrepeats\tarmed_seqs(0-based)\tarmed_layers(slot,silayer)"
+        "row\tname\tbars\trepeats\tbarsXrepeats\tarmed_seqs(0-based)\tarmed_layers(slot,silayer, all ON+Keep)"
     )
     for r in rep:
         if _should_skip_row(r):
