@@ -820,10 +820,33 @@ def extract_transpose_cents(device):
         return 0
 
 
-def _collect_slice_points(sample_part):
+def _simpler_globals_playback_mode(device):
+    """
+    Simpler Globals/PlaybackMode (Live 11/12):
+      0 = Classic, 2 = Slice (Slicer). Other values are left to legacy rules downstream.
+    """
+    if device is None:
+        return None
+    globals_el = find_element_by_tag(device, 'Globals')
+    if globals_el is None:
+        return None
+    pm = find_element_by_tag(globals_el, 'PlaybackMode')
+    if pm is None or 'Value' not in pm.attrib:
+        return None
+    try:
+        return int(pm.attrib['Value'])
+    except (ValueError, TypeError):
+        return None
+
+
+def _collect_slice_points(sample_part, simpler_playback_mode=None):
     """
     Locate slice definitions inside a Simpler sample part.
     Returns tuple: (source_tag, seconds_list, samples_list)
+
+    simpler_playback_mode: from _simpler_globals_playback_mode (0=Classic, 2=Slice).
+    Classic must NOT use transient UserOnsets as slicer slices; Slice mode must still
+    get InitialSlicePointsFromOnsets when warped (see Frozen_Git pad 1 vs pad 0).
     """
     slice_tags = [
         'ManualSlicePoints',
@@ -845,28 +868,88 @@ def _collect_slice_points(sample_part):
     for tag in slice_tags:
         container = find_element_by_tag(sample_part, tag)
         if container is not None and len(container):
-            # InitialSlicePointsFromOnsets are auto-computed by Ableton for ALL samples
-            # (including warped/clip-mode ones). Only treat them as actual slices when:
-            #  • the sample is NOT warped, AND
-            #  • AreSlicesFromOnsetsEditable is true (user is in Slice/Transient mode)
+            # InitialSlicePointsFromOnsets are auto-computed for all samples. Only treat as
+            # slicer slices when in Live Slice mode (2), or when unwarped + user edited onsets.
             if tag == 'InitialSlicePointsFromOnsets':
-                if is_warped:
-                    continue
-                editable_el = find_element_by_tag(sample_part, 'AreSlicesFromOnsetsEditable')
-                if editable_el is None or editable_el.attrib.get('Value', 'false').lower() != 'true':
-                    continue
+                if simpler_playback_mode == 2:
+                    pass  # Slice (Slicer): use onset grid even if warped / not editable
+                else:
+                    if is_warped:
+                        continue
+                    editable_el = find_element_by_tag(sample_part, 'AreSlicesFromOnsetsEditable')
+                    if editable_el is None or editable_el.attrib.get('Value', 'false').lower() != 'true':
+                        continue
             seconds, samples = _parse_slice_point_container(container)
             if seconds or samples:
                 return tag, seconds, samples
     
-    # Fallback: use user-defined onsets if nothing else is set and sample is not warped
-    if not is_warped and warp_props is not None:
+    # UserOnsets: only in Slice mode, or legacy (mode unknown) when not warped — never Classic (0)
+    if warp_props is not None:
+        use_user_onsets = False
+        if simpler_playback_mode == 2:
+            use_user_onsets = True
+        elif simpler_playback_mode == 0:
+            use_user_onsets = False
+        elif simpler_playback_mode is None and not is_warped:
+            use_user_onsets = True
+        if use_user_onsets:
+            user_onsets = warp_props.find('.//UserOnsets')
+            if user_onsets is not None and len(user_onsets):
+                seconds, _samples = _parse_slice_point_container(user_onsets)
+                if seconds:
+                    return 'UserOnsets', seconds, []
+    return None, [], []
+
+
+def _collect_all_slice_points_for_embed(sample_part, default_sample_rate):
+    """
+    Union all Ableton slice/onset containers — regardless of Simpler PlaybackMode.
+    Used for optional <slices> when cellmode is sample/clip (not full slicer).
+    """
+    if sample_part is None:
+        return []
+    slice_tags = [
+        'ManualSlicePoints',
+        'SlicePoints',
+        'RegionSlicePoints',
+        'BeatSlicePoints',
+        'InitialSlicePointsFromOnsets',
+    ]
+    positions = []
+    for tag in slice_tags:
+        container = find_element_by_tag(sample_part, tag)
+        if container is None or not len(container):
+            continue
+        seconds, samples = _parse_slice_point_container(container)
+        for p in samples:
+            try:
+                positions.append(int(p))
+            except (TypeError, ValueError):
+                continue
+        if seconds and default_sample_rate:
+            try:
+                rate = float(default_sample_rate)
+                positions.extend(int(round(s * rate)) for s in seconds)
+            except (TypeError, ValueError):
+                pass
+    warp_props = find_element_by_tag(sample_part, 'SampleWarpProperties')
+    if warp_props is not None:
         user_onsets = warp_props.find('.//UserOnsets')
         if user_onsets is not None and len(user_onsets):
-            seconds, _samples = _parse_slice_point_container(user_onsets)
-            if seconds:
-                return 'UserOnsets', seconds, []
-    return None, [], []
+            seconds, samples = _parse_slice_point_container(user_onsets)
+            for p in samples:
+                try:
+                    positions.append(int(p))
+                except (TypeError, ValueError):
+                    continue
+            if seconds and default_sample_rate:
+                try:
+                    rate = float(default_sample_rate)
+                    positions.extend(int(round(s * rate)) for s in seconds)
+                except (TypeError, ValueError):
+                    pass
+    positions.append(0)
+    return sorted(set(max(0, int(p)) for p in positions))
 
 
 def extract_slicing_info(device, sample_part):
@@ -888,12 +971,17 @@ def extract_slicing_info(device, sample_part):
         'transpose_cents': extract_transpose_cents(device),
         # Beta: warped classic clip — onset positions for <slices> without forcing slicer mode
         'clip_transient_embed_samples': [],
+        # All onset/slice markers (any Live mode); for optional <slices> when not Slicer cellmode
+        'non_slicer_slice_samples': [],
     }
     
     if device is None or sample_part is None:
         return info
     
     try:
+        simpler_pb = _simpler_globals_playback_mode(device)
+        info['simpler_playback_mode'] = simpler_pb
+
         sample_ref = find_element_by_tag(sample_part, 'SampleRef')
         if sample_ref is not None:
             duration_elem = find_element_by_tag(sample_ref, 'DefaultDuration')
@@ -917,7 +1005,9 @@ def extract_slicing_info(device, sample_part):
             iw_embed = find_element_by_tag(warp_props_embed, 'IsWarped')
             if iw_embed is not None and iw_embed.attrib.get('Value', 'false').lower() == 'true':
                 is_warped_embed = True
-        if is_warped_embed:
+        # Classic (0) and Slice (2) do not use warped auto-onset embed here — Classic stays sample;
+        # Slice uses real slice positions from _collect_slice_points.
+        if is_warped_embed and simpler_pb not in (0, 2):
             onsets_container = find_element_by_tag(sample_part, 'InitialSlicePointsFromOnsets')
             if onsets_container is not None and len(onsets_container):
                 sec_emb, smp_emb = _parse_slice_point_container(onsets_container)
@@ -940,7 +1030,7 @@ def extract_slicing_info(device, sample_part):
         if beat_grid_elem is not None and 'Value' in beat_grid_elem.attrib:
             info['beat_grid'] = beat_grid_elem.attrib['Value']
         
-        source_tag, seconds, samples = _collect_slice_points(sample_part)
+        source_tag, seconds, samples = _collect_slice_points(sample_part, simpler_playback_mode=simpler_pb)
         if source_tag:
             info['slice_source'] = source_tag
             info['has_slices'] = True
@@ -969,6 +1059,13 @@ def extract_slicing_info(device, sample_part):
             info['slice_positions_samples'].append(0)
             cleaned = sorted(set(max(0, int(pos)) for pos in info['slice_positions_samples']))
             info['slice_positions_samples'] = cleaned
+
+        # Informative / optional embed: every slice container Live saved, even in Classic / non-Slicer
+        if not info['has_slices']:
+            info['non_slicer_slice_samples'] = _collect_all_slice_points_for_embed(
+                sample_part, info.get('default_sample_rate'))
+            if len(info['non_slicer_slice_samples']) <= 1:
+                info['non_slicer_slice_samples'] = []
         
         return info
     except Exception as e:
@@ -1533,7 +1630,9 @@ def make_drum_rack_pads(session, pad_list, tempo, project_label=''):
                 
                 # Check if this is a warped stem
                 warp_info = detect_warped_stem(pad_info['simpler'])
-                
+                slicing_preview = params.get('slicing') or {}
+                simpler_pb = slicing_preview.get('simpler_playback_mode')
+
                 # Determine loop mode and trigger mode
                 loopmode = '0'  # off by default
                 loopstart = params.get('loop_start', '0')
@@ -1572,10 +1671,26 @@ def make_drum_rack_pads(session, pad_list, tempo, project_label=''):
                     beatcount = str(beat_count)
                     
                     # Use clip mode if sample is warped (regardless of beat_count)
+                    # Warped: clip mode only when not Live Classic (0) or Slice/Slicer (2)
                     if warp_info.get('is_warped', False):
-                        cellmode = '1'  # Clip mode for warped samples
-                        loopmode = '1'  # Loop enabled
-                        logger.info(f'    → Warped sample: {beat_count} beats ({beat_count/4} bars), clip mode enabled')
+                        if simpler_pb == 2:
+                            cellmode = '0'
+                            loopmode = '0'
+                            logger.info(
+                                f'    → Warped Slicer mode: {beat_count} beats — cell mode from slice points'
+                            )
+                        elif simpler_pb == 0:
+                            cellmode = '0'
+                            loopmode = '0'
+                            logger.info(
+                                f'    → Warped Classic: {beat_count} beats — sample mode (not clip)'
+                            )
+                        else:
+                            cellmode = '1'  # Clip mode for other / legacy warped samples
+                            loopmode = '1'  # Loop enabled
+                            logger.info(
+                                f'    → Warped sample: {beat_count} beats ({beat_count/4} bars), clip mode enabled'
+                            )
                     else:
                         # Unwarped sample - sampler mode
                         loopmode = '0'  # Don't enable loop by default for unwarped samples
@@ -1737,6 +1852,38 @@ def make_drum_rack_pads(session, pad_list, tempo, project_label=''):
                             logger.info(
                                 f'    → Clip transient embed: {before_ct} onsets → {len(slice_positions)} '
                                 f'(max {CLIP_TRANSIENT_SLICE_MAX_BETA}, density priority)'
+                            )
+                elif not has_slices and slicing_info.get('non_slicer_slice_samples'):
+                    default_rate = slicing_info.get('default_sample_rate')
+                    slice_positions = list(slicing_info.get('non_slicer_slice_samples', []))
+                    if slice_positions and wav_info and default_rate and default_rate > 0:
+                        try:
+                            if float(default_rate) != float(wav_info['sample_rate']):
+                                scale = float(wav_info['sample_rate']) / float(default_rate)
+                                slice_positions = [int(round(pos * scale)) for pos in slice_positions]
+                        except (TypeError, ValueError):
+                            pass
+                    if slice_positions:
+                        if 0 not in slice_positions:
+                            slice_positions.append(0)
+                        try:
+                            samlen_int = int(float(samlen))
+                            slice_positions = [max(0, min(int(pos), samlen_int)) for pos in slice_positions]
+                        except (TypeError, ValueError):
+                            slice_positions = [max(0, int(pos)) for pos in slice_positions]
+                        slice_positions = sorted(set(slice_positions))
+                        before_ct = len(slice_positions)
+                        try:
+                            samlen_int_lim = int(float(samlen))
+                        except (TypeError, ValueError):
+                            samlen_int_lim = None
+                        slice_positions = limit_slice_positions_density_priority(
+                            slice_positions, CLIP_TRANSIENT_SLICE_MAX_BETA, samlen_int_lim
+                        )
+                        if before_ct > len(slice_positions):
+                            logger.info(
+                                f'    → Non-slicer slice markers: {before_ct} → {len(slice_positions)} '
+                                f'(max {CLIP_TRANSIENT_SLICE_MAX_BETA})'
                             )
                 
                 # Handle multisample mode
@@ -2353,6 +2500,23 @@ def _clip_length_beats_from_midi_clip(midi_clip, extracted_note_count=0, als_maj
     return 1.0
 
 
+def _midi_clip_has_notes(midi_clip):
+    """True if this MidiClip element has at least one note in KeyTracks."""
+    if midi_clip is None:
+        return False
+    notes = find_element_by_tag(midi_clip, 'Notes')
+    if notes is None:
+        return False
+    key_tracks = find_element_by_tag(notes, 'KeyTracks')
+    if key_tracks is None:
+        return False
+    for key_track in key_tracks:
+        notes_elem = find_element_by_tag(key_track, 'Notes')
+        if notes_elem is not None and len(notes_elem) > 0:
+            return True
+    return False
+
+
 def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=None, unquantised=False, expected_seq_params=None,
                             als_major_version=None):
     """
@@ -2433,6 +2597,9 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
         # (named A/B/C/D) override the matching slot (arrangement takes priority).
         sub_layers = [None, None, None, None]  # indexed by layer: 0=A,1=B,2=C,3=D
         _layer_name_to_idx = {'a': 0, 'b': 1, 'c': 2, 'd': 3}
+        # Highest A–D slot index present in ArrangerAutomation (named clips). Matches hand-tuned
+        # Frozen_Git presets: e.g. Seq13 with arrangement A+B+C → activeseqlayer=2 on sublayer 0 only.
+        arrangement_max_layer_idx = None
         
         try:
             device_chain = find_element_by_tag(track, 'DeviceChain')
@@ -2498,6 +2665,8 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                                 start_time = 0.0
                             if layer_idx not in best_per_layer or start_time < best_per_layer[layer_idx][0]:
                                 best_per_layer[layer_idx] = (start_time, arr_clip)
+                        if best_per_layer:
+                            arrangement_max_layer_idx = max(best_per_layer.keys())
                         for layer_idx, (_, arr_clip) in best_per_layer.items():
                             sub_layers[layer_idx] = arr_clip
                             sig = _midi_clip_signature(arr_clip)
@@ -2537,10 +2706,22 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
         if not sub_layers:
             sub_layers = []
         
+        # Lowest slot that actually has note data; used when there are no named arrangement clips.
+        first_layer_with_notes = -1
+        for si in range(4):
+            mc = sub_layers[si] if si < len(sub_layers) else None
+            if _midi_clip_has_notes(mc):
+                first_layer_with_notes = si
+                break
+        track_activeseqlayer_head = (
+            arrangement_max_layer_idx
+            if arrangement_max_layer_idx is not None
+            else (first_layer_with_notes if first_layer_with_notes >= 0 else 0)
+        )
+        
         # Create sequence cells for each sublayer (firmware 2.3+ format)
         # Create all 4 sublayers (A/B/C/D) as separate cell elements
         total_notes_all_layers = 0
-        first_layer_with_notes = -1
         
         # DEBUG: Log track info before processing sublayers
         # Verify we have the right clips by checking first clip's note count
@@ -2738,10 +2919,6 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
             # LoopStart/LoopEnd and note-derived lengths are trusted; allow up to 256 beats (64 bars).
             # CurrentEnd > 64 is already rejected above, so no extra cap needed for 32-bar clips.
             
-            # Track first layer with notes for activeseqlayer
-            if sublayer_events and first_layer_with_notes == -1:
-                first_layer_with_notes = sublayer_idx
-            
             total_notes_all_layers += len(sublayer_events)
             
             # Detect note grid pattern and quantization state (independent of pad/keys mode)
@@ -2897,6 +3074,12 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                 if sublayer_events:
                     sample_lencount = sublayer_events[0].get('lencount')
                     logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: After unquantised fix, first event lencount={sample_lencount}')
+                if sublayer_events:
+                    sublayer_events.sort(key=lambda e: (
+                        int(e.get('strtks', 0)),
+                        int(e.get('pitch', 0)),
+                        int(str(e.get('chan', 0))),
+                    ))
             else:
                 # Quantised: use 3840 ticks/beat for both Keys/MIDI and Pads mode
                 # CRITICAL: Step values must match the step_len resolution
@@ -2919,10 +3102,14 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                 # Sort events chronologically (by strtks) — Ableton's KeyTrack iteration produces
                 # events grouped by pitch; FIX presets sort strictly by strtks so the device reads
                 # the sequence in time order.
-                sublayer_events.sort(key=lambda e: (int(e.get('strtks', 0)), int(e.get('pitch', 0))))
+                sublayer_events.sort(key=lambda e: (
+                    int(e.get('strtks', 0)),
+                    int(e.get('pitch', 0)),
+                    int(str(e.get('chan', 0))),
+                ))
                 # #region agent log
                 if sublayer_events:
-                    _dbg('xml_read.py:2837', 'H1/H7 lencount=1 + chronological sort applied', data={
+                    _dbg('xml_read.py:2837', 'H1/H7 lencount=1 + chronological sort', data={
                         'track_idx': track_idx, 'sublayer': chr(65+sublayer_idx),
                         'seq_loc_pad': sequence_location_pad, 'seq_mode': seq_mode,
                         'steps_per_beat': steps_per_beat,
@@ -2931,6 +3118,7 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                         'first3_lentks': [int(e.get('lentks', -1)) for e in sublayer_events[:3]],
                         'first3_pitch': [int(e.get('pitch', -1)) for e in sublayer_events[:3]],
                         'first3_strtks': [int(e.get('strtks', -1)) for e in sublayer_events[:3]],
+                        'first3_chan': [int(str(e.get('chan', 0))) for e in sublayer_events[:3]],
                         'event_count': len(sublayer_events),
                         'runId': 'post-fix',
                     }, hypothesis='H1_H7')
@@ -2983,15 +3171,23 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                 seqpadmapdest_val = '0'
                 midioutchan_val = str(mode_target)  # MIDI channel (0-15)
             
+            if sublayer_idx == 0:
+                if seq_mode == 'Pads' and len(sublayer_events) >= 3:
+                    dispmode_val = '0'
+                else:
+                    dispmode_val = '1'
+            else:
+                dispmode_val = '0'
+            
             params.attrib = {
                 'notesteplen': str(step_len),  # Calculated based on clip length
                 'notestepcount': str(step_count),  # Calculated from clip length
                 'dutycyc': '1000',
                 'quantsizeseq': '1',
-                'dispmode': '1' if sublayer_idx == 0 else '0',  # Only first layer visible by default
+                'dispmode': dispmode_val,
                 'seqpadmapdest': seqpadmapdest_val,
                 'seqplayenable': '0',  # Device-side state; always emit 0 (never derived from project)
-                'activeseqlayer': str(first_layer_with_notes if first_layer_with_notes >= 0 else 0),
+                'activeseqlayer': str(track_activeseqlayer_head if sublayer_idx == 0 else 0),
                 'midioutchan': midioutchan_val,
                 'seqstepmode': seqstepmode_val,
                 'midiseqcellchan': '0'
@@ -3006,8 +3202,10 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                 'clip_length_beats': float(clip_length_beats),
                 'step_len_written': step_len,
                 'notestepcount_written': step_count,
-                'dispmode_written': '1' if sublayer_idx == 0 else '0',
-                'activeseqlayer_written': first_layer_with_notes if first_layer_with_notes >= 0 else 0,
+                'dispmode_written': dispmode_val,
+                'activeseqlayer_written': track_activeseqlayer_head if sublayer_idx == 0 else 0,
+                'arrangement_max_layer_idx': arrangement_max_layer_idx,
+                'track_activeseqlayer_head': track_activeseqlayer_head,
                 'first_layer_with_notes': first_layer_with_notes,
                 'event_count': len(sublayer_events),
                 'is_unquantised': bool(is_unquantised),
