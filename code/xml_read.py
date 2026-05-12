@@ -948,7 +948,6 @@ def _collect_all_slice_points_for_embed(sample_part, default_sample_rate):
                     positions.extend(int(round(s * rate)) for s in seconds)
                 except (TypeError, ValueError):
                     pass
-    positions.append(0)
     return sorted(set(max(0, int(p)) for p in positions))
 
 
@@ -1016,7 +1015,6 @@ def extract_slicing_info(device, sample_part):
                     embed_pts.extend(
                         int(round(s * float(info['default_sample_rate']))) for s in sec_emb
                     )
-                embed_pts.append(0)
                 info['clip_transient_embed_samples'] = sorted(
                     set(max(0, int(p)) for p in embed_pts)
                 )
@@ -1055,16 +1053,15 @@ def extract_slicing_info(device, sample_part):
                 info['playthrough'] = playback_mode == 2
         
         if info['slice_positions_samples']:
-            # Always include slice at index 0 for completeness
-            info['slice_positions_samples'].append(0)
-            cleaned = sorted(set(max(0, int(pos)) for pos in info['slice_positions_samples']))
-            info['slice_positions_samples'] = cleaned
+            info['slice_positions_samples'] = sorted(
+                set(max(0, int(pos)) for pos in info['slice_positions_samples']))
 
         # Informative / optional embed: every slice container Live saved, even in Classic / non-Slicer
         if not info['has_slices']:
             info['non_slicer_slice_samples'] = _collect_all_slice_points_for_embed(
                 sample_part, info.get('default_sample_rate'))
-            if len(info['non_slicer_slice_samples']) <= 1:
+            nss = info['non_slicer_slice_samples']
+            if not nss or (len(nss) == 1 and nss[0] == 0):
                 info['non_slicer_slice_samples'] = []
         
         return info
@@ -1813,8 +1810,6 @@ def make_drum_rack_pads(session, pad_list, tempo, project_label=''):
                         except (TypeError, ValueError):
                             pass
                     if slice_positions:
-                        if 0 not in slice_positions:
-                            slice_positions.append(0)
                         try:
                             samlen_int = int(float(samlen))
                             slice_positions = [max(0, min(int(pos), samlen_int)) for pos in slice_positions]
@@ -1832,8 +1827,6 @@ def make_drum_rack_pads(session, pad_list, tempo, project_label=''):
                         except (TypeError, ValueError):
                             pass
                     if slice_positions:
-                        if 0 not in slice_positions:
-                            slice_positions.append(0)
                         try:
                             samlen_int = int(float(samlen))
                             slice_positions = [max(0, min(int(pos), samlen_int)) for pos in slice_positions]
@@ -1864,8 +1857,6 @@ def make_drum_rack_pads(session, pad_list, tempo, project_label=''):
                         except (TypeError, ValueError):
                             pass
                     if slice_positions:
-                        if 0 not in slice_positions:
-                            slice_positions.append(0)
                         try:
                             samlen_int = int(float(samlen))
                             slice_positions = [max(0, min(int(pos), samlen_int)) for pos in slice_positions]
