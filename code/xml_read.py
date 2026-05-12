@@ -45,6 +45,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# #region agent log
+import json as _json_dbg
+import time as _time_dbg
+_DEBUG_LOG_PATH = '/Users/simon/Dropbox/Blackbox Stuff/ableton_blackbox/.cursor/debug-d8533d.log'
+_DEBUG_SESSION_ID = 'd8533d'
+
+def _dbg(location, message, data=None, hypothesis=None):
+    try:
+        payload = {
+            'sessionId': _DEBUG_SESSION_ID,
+            'timestamp': int(_time_dbg.time() * 1000),
+            'location': location,
+            'message': message,
+        }
+        if data is not None:
+            payload['data'] = data
+        if hypothesis is not None:
+            payload['hypothesisId'] = hypothesis
+        with open(_DEBUG_LOG_PATH, 'a') as _f:
+            _f.write(_json_dbg.dumps(payload) + '\n')
+    except Exception:
+        pass
+# #endregion
+
 # Beta branch (beta/clip-transients): max slice markers embedded on clip-mode (warped) cells
 CLIP_TRANSIENT_SLICE_MAX_BETA = 128
 
@@ -2255,6 +2279,26 @@ def _clip_length_beats_from_midi_clip(midi_clip, extracted_note_count=0):
             beats = note_max / 2.0
             logger.debug(f'Clip length: 2× timeline play={play_range} note_max={note_max} -> {beats} beats')
             return max(1.0, min(beats, 256.0))
+        # Note span >> timeline: long ALS Duration / loop storage (e.g. t=0 d=160) while
+        # CurrentStart/CurrentEnd is beat-native (e.g. 32 beats = 8 bars). Without this branch,
+        # we fall through to play_range/2 and halve real bar count (Frozen “8 bar → 4 bar”).
+        # Symmetric to “arrangement repeat” above: when timeline is shorter in raw note units
+        # but is the visible block length in beats, timeline wins.
+        if note_max > play_range * ARR_NOTE_REPEAT_RATIO + eps:
+            pr = max(1.0, min(play_range, 256.0))
+            logger.debug(
+                f'Clip length: note_max >> play_range note_max={note_max} play_range={play_range} '
+                f'-> {pr} beats (timeline authoritative)'
+            )
+            # #region agent log
+            _dbg(
+                'xml_read.py:_clip_length_beats',
+                'timeline authoritative (note storage >> play_range)',
+                {'play_range': play_range, 'note_max': note_max, 'beats': pr},
+                hypothesis='H8bar_timeline',
+            )
+            # #endregion
+            return pr
         # Legacy: arrangement span matches note span (integer ALS timeline)
         if note_max > 0 and abs(play_range - note_max) <= rel_tol * max(play_range, note_max) + eps:
             if play_range >= 128:
@@ -2833,8 +2877,30 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                     # This ensures step mode is ON (quantised) on the device
                     event['strtks'] = int(time_val * 3840)  # 3840 ticks/beat for quantised
                     event['lentks'] = 960  # Constant 960 ticks for quantised sequences (matches reference)
-                    # Recalculate lencount based on detected step_len (steps_per_beat)
-                    event['lencount'] = max(1, int(dur_val * steps_per_beat))  # Step-based length for quantised
+                    # Drum-rack workflow: notes are pad triggers, not sustained gates. All FIX presets
+                    # use lencount=1 (1-step gate) regardless of MIDI Duration. dur_val is preserved
+                    # in event metadata (time_val/dur_val) for any future grid analysis but is no
+                    # longer mapped onto lencount.
+                    event['lencount'] = 1
+                # Sort events chronologically (by strtks) — Ableton's KeyTrack iteration produces
+                # events grouped by pitch; FIX presets sort strictly by strtks so the device reads
+                # the sequence in time order.
+                sublayer_events.sort(key=lambda e: (int(e.get('strtks', 0)), int(e.get('pitch', 0))))
+                # #region agent log
+                if sublayer_events:
+                    _dbg('xml_read.py:2837', 'H1/H7 lencount=1 + chronological sort applied', data={
+                        'track_idx': track_idx, 'sublayer': chr(65+sublayer_idx),
+                        'seq_loc_pad': sequence_location_pad, 'seq_mode': seq_mode,
+                        'steps_per_beat': steps_per_beat,
+                        'first3_dur_val': [round(float(e.get('dur_val', 0)), 4) for e in sublayer_events[:3]],
+                        'first3_lencount': [int(e.get('lencount', -1)) for e in sublayer_events[:3]],
+                        'first3_lentks': [int(e.get('lentks', -1)) for e in sublayer_events[:3]],
+                        'first3_pitch': [int(e.get('pitch', -1)) for e in sublayer_events[:3]],
+                        'first3_strtks': [int(e.get('strtks', -1)) for e in sublayer_events[:3]],
+                        'event_count': len(sublayer_events),
+                        'runId': 'post-fix',
+                    }, hypothesis='H1_H7')
+                # #endregion
             
             # Create cell element for this sublayer
             # CRITICAL: Use sequence_row and sequence_column to ensure correct location
@@ -2896,6 +2962,23 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                 'seqstepmode': seqstepmode_val,
                 'midiseqcellchan': '0'
             }
+            # #region agent log
+            _dbg('xml_read.py:2891', 'H2/H3/H4 noteseq cell params', data={
+                'track_idx': track_idx, 'sublayer': chr(65+sublayer_idx),
+                'sublayer_idx': sublayer_idx,
+                'row': sequence_row, 'col': sequence_column,
+                'seq_loc_pad': sequence_location_pad,
+                'seq_mode': seq_mode,
+                'clip_length_beats': float(clip_length_beats),
+                'step_len_written': step_len,
+                'notestepcount_written': step_count,
+                'dispmode_written': '1' if sublayer_idx == 0 else '0',
+                'activeseqlayer_written': first_layer_with_notes if first_layer_with_notes >= 0 else 0,
+                'first_layer_with_notes': first_layer_with_notes,
+                'event_count': len(sublayer_events),
+                'is_unquantised': bool(is_unquantised),
+            }, hypothesis='H2_H3_H4')
+            # #endregion
             
             # Add sequence element with events
             sequence = ET.SubElement(cell, 'sequence')
@@ -3113,6 +3196,18 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
         params = ET.SubElement(cell, 'params')
         repeats = max(1, int(sec.get('repeats', 1)))
         params.attrib = {'sectionrepeats': str(repeats)}
+        # #region agent log
+        _dbg('xml_read.py:3115', 'H6 section cell write', data={
+            'row': row_idx,
+            'name': sec_name,
+            'repeats_written': repeats,
+            'repeats_in_sec': sec.get('repeats', None),
+            'pad_conds_on_count': sum(1 for v in (sec.get('pad_conds') or {}).values() if int(v) >= 1),
+            'seq_conds_on_count': sum(1 for v in (sec.get('seq_conds') or {}).values() if int(v) >= 1),
+            'pad_conds_keys_on': [list(k) for k, v in (sec.get('pad_conds') or {}).items() if int(v) >= 1],
+            'seq_conds_keys_on': [list(k) for k, v in (sec.get('seq_conds') or {}).items() if int(v) >= 1],
+        }, hypothesis='H5_H6')
+        # #endregion
 
         sequence = ET.SubElement(cell, 'sequence')
 
@@ -3462,6 +3557,15 @@ def extract_locators(root):
 
     sections.sort(key=lambda s: s['time'])
     logger.info(f'Extracted {len(sections)} locators for song sections')
+    # #region agent log
+    _dbg('xml_read.py:3464', 'H5 locator extraction result', data={
+        'count': len(sections),
+        'locators': [
+            {'time': float(s['time']), 'raw_name': s['raw_name'], 'parsed_name': s['name'], 'repeats': int(s['repeats'])}
+            for s in sections
+        ],
+    }, hypothesis='H5_H6')
+    # #endregion
     return sections
 
 
@@ -3927,6 +4031,14 @@ def compare_section_content(expected_preset_path, actual_preset_path, max_sectio
 def main(args):
     logger.info('=== Ableton to Blackbox Converter v0.3 (Drum Rack Edition) ===')
     logger.info('Reading Ableton project...')
+    # #region agent log
+    _dbg('xml_read.py:main', 'conversion start', data={
+        'input': args.Input,
+        'output': args.Output,
+        'song_mode': bool(getattr(args, 'song_mode', False)),
+        'unquantised': bool(getattr(args, 'unquantised', False)),
+    }, hypothesis='startup')
+    # #endregion
     
     try:
         root = read_project(args.Input)
