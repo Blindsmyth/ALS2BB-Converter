@@ -2151,7 +2151,13 @@ def _max_note_span_in_clip(midi_clip):
     return max_end
 
 
-def _clip_length_beats_from_midi_clip(midi_clip, extracted_note_count=0):
+# Arrangement clips can span many bars; notestepcount is coarsened to ≤256 steps in
+# make_drum_rack_sequences. Capping clip length at 256 beats here truncates timelines
+# (e.g. 264 beats → 64 bars vs 66 bars on pad 15 layer B).
+_MAX_CLIP_LENGTH_BEATS = 4096.0
+
+
+def _clip_length_beats_from_midi_clip(midi_clip, extracted_note_count=0, als_major_version=None):
     """
     Convert ALS clip loop / arrangement bounds to sequence length in beats.
 
@@ -2215,31 +2221,38 @@ def _clip_length_beats_from_midi_clip(midi_clip, extracted_note_count=0):
             # Live uses different scalings: 128→4 beats (/32) vs 64→4 beats (/16) for same bar count.
             beats = (loop_span / 32.0) if loop_span >= 128 else (loop_span / 16.0)
             logger.debug(f'Clip length: legacy loop span={loop_span} note_max={note_max} -> {beats} beats (legacy /32 or /16)')
-            return max(1.0, min(beats, 256.0))
+            return max(1.0, min(beats, _MAX_CLIP_LENGTH_BEATS))
         # Beat-native: short loop with non-integer note extent (e.g. 4-bar loop, notes 0–3.25)
         if loop_span <= 64 and note_max <= 64 and (
             abs(loop_span - note_max) > 0.1 or abs(note_max - round(note_max)) > 1e-5
         ):
             logger.debug(f'Clip length: beat-native loop span={loop_span} note_max={note_max} -> {loop_span} beats')
-            return max(1.0, min(loop_span, 256.0))
-        # Small matching integer loop (legacy raw)
+            return max(1.0, min(loop_span, _MAX_CLIP_LENGTH_BEATS))
+        # Small matching integer loop (legacy raw). Live 11+ (MajorVersion >= 5): loop brace is
+        # already in beats (e.g. span 4 = 4 beats); do not halve (Frozen Seq1 would become 2 beats).
         if loop_span <= 32 and note_max <= 32 and abs(loop_span - note_max) < eps + 1e-6:
-            beats = loop_span / 2.0
-            logger.debug(f'Clip length: small legacy loop span={loop_span} -> {beats} beats (/2)')
-            return max(1.0, min(beats, 256.0))
+            if als_major_version is not None and als_major_version >= 5:
+                beats = loop_span
+                logger.debug(
+                    f'Clip length: beat-native small loop span={loop_span} note_max={note_max} -> {beats} beats'
+                )
+            else:
+                beats = loop_span / 2.0
+                logger.debug(f'Clip length: small legacy loop span={loop_span} -> {beats} beats (/2)')
+            return max(1.0, min(beats, _MAX_CLIP_LENGTH_BEATS))
         if loop_span <= 64 and note_max <= 64:
             logger.debug(f'Clip length: short loop span={loop_span} note_max={note_max} -> {loop_span} beats')
-            return max(1.0, min(loop_span, 256.0))
+            return max(1.0, min(loop_span, _MAX_CLIP_LENGTH_BEATS))
         beats = loop_span / 2.0
         logger.debug(f'Clip length: loop fallback span={loop_span} -> {beats} beats (/2)')
-        return max(1.0, min(beats, 256.0))
+        return max(1.0, min(beats, _MAX_CLIP_LENGTH_BEATS))
 
     # --- Loop off: arrangement extent ---
     if not loop_on and play_range > 0:
         # Empty MIDI (layer placeholder / audio-only): timeline is already in beats in Live 11+.
         # Applying /2 wrongly halves (e.g. Seq13B 80→40 beats, Seq16B 244→122 beats).
         if note_max < eps:
-            pr = max(1.0, min(play_range, 256.0))
+            pr = max(1.0, min(play_range, _MAX_CLIP_LENGTH_BEATS))
             # If we already parsed notes from KeyTracks, never treat this as an empty clip — e.g. XML
             # span heuristics can miss some layouts; leading silence + notes still needs full timeline.
             if extracted_note_count > 0:
@@ -2263,29 +2276,39 @@ def _clip_length_beats_from_midi_clip(midi_clip, extracted_note_count=0):
         # means the clip’s material is shorter than the block you drew on the arrangement (e.g. the
         # same pattern looped for many bars, or a short pattern in a long clip region). For Blackbox,
         # we want the **full arrangement block length** as the sequence length in **beats**, so we set
-        # clip_length_beats = play_range (capped at 256 beats), not note_max and not play_range/2.
+        # clip_length_beats = play_range (see _MAX_CLIP_LENGTH_BEATS), not note_max and not play_range/2.
         #
         # Example: note_max = 64, play_range = 192 → use 192 beats (not 64, not 96).
         if note_max > 0 and play_range > note_max * ARR_NOTE_REPEAT_RATIO + eps:
             logger.debug(f'Clip length: arrangement repeat play_range={play_range} note_max={note_max} -> {play_range} beats')
-            return max(1.0, min(play_range, 256.0))
+            out = max(1.0, min(play_range, _MAX_CLIP_LENGTH_BEATS))
+            # #region agent log
+            if play_range > 256:
+                _dbg(
+                    'xml_read.py:_clip_length_beats',
+                    'arrangement repeat (long timeline)',
+                    {'play_range': play_range, 'note_max': note_max, 'beats_out': out},
+                    hypothesis='H_clip_beat_cap',
+                )
+            # #endregion
+            return out
         # Timeline in beats, MIDI durations in 16th-note units (e.g. 4 beats vs 64)
         if play_range <= 32 and note_max > play_range * 8 - eps and \
            abs(note_max - play_range * 16) < eps * max(note_max, 1.0):
             logger.debug(f'Clip length: beat timeline vs 16ths play={play_range} note_max={note_max} -> {play_range} beats')
-            return max(1.0, min(play_range, 256.0))
+            return max(1.0, min(play_range, _MAX_CLIP_LENGTH_BEATS))
         # Note span ~2× timeline (storage quirk)
         if note_max > play_range * 1.2 + eps and abs(note_max - 2.0 * play_range) < 1.0 + eps:
             beats = note_max / 2.0
             logger.debug(f'Clip length: 2× timeline play={play_range} note_max={note_max} -> {beats} beats')
-            return max(1.0, min(beats, 256.0))
+            return max(1.0, min(beats, _MAX_CLIP_LENGTH_BEATS))
         # Note span >> timeline: long ALS Duration / loop storage (e.g. t=0 d=160) while
         # CurrentStart/CurrentEnd is beat-native (e.g. 32 beats = 8 bars). Without this branch,
         # we fall through to play_range/2 and halve real bar count (Frozen “8 bar → 4 bar”).
         # Symmetric to “arrangement repeat” above: when timeline is shorter in raw note units
         # but is the visible block length in beats, timeline wins.
         if note_max > play_range * ARR_NOTE_REPEAT_RATIO + eps:
-            pr = max(1.0, min(play_range, 256.0))
+            pr = max(1.0, min(play_range, _MAX_CLIP_LENGTH_BEATS))
             logger.debug(
                 f'Clip length: note_max >> play_range note_max={note_max} play_range={play_range} '
                 f'-> {pr} beats (timeline authoritative)'
@@ -2299,29 +2322,39 @@ def _clip_length_beats_from_midi_clip(midi_clip, extracted_note_count=0):
             )
             # #endregion
             return pr
-        # Legacy: arrangement span matches note span (integer ALS timeline)
+        # Legacy: arrangement span matches note span (integer ALS timeline in older exports).
+        # Live 11+ (MajorVersion >= 5): matching spans in beat space must not be divided by 16 —
+        # e.g. 32 beats (8 bars) with note_max=32 was wrongly turned into 2 beats (Frozen Seq11).
         if note_max > 0 and abs(play_range - note_max) <= rel_tol * max(play_range, note_max) + eps:
             if play_range >= 128:
                 beats = play_range / 32.0
                 logger.debug(f'Clip length: legacy match play={play_range} -> {beats} beats (/32)')
             elif play_range >= 32:
-                beats = play_range / 16.0
-                logger.debug(f'Clip length: legacy match play={play_range} -> {beats} beats (/16)')
+                if als_major_version is not None and als_major_version >= 5:
+                    beats = play_range
+                    logger.debug(
+                        f'Clip length: beat-native equal span (Live 11+) play={play_range} note_max={note_max} '
+                        f'-> {beats} beats'
+                    )
+                else:
+                    beats = play_range / 16.0
+                    logger.debug(f'Clip length: legacy match play={play_range} -> {beats} beats (/16)')
             else:
                 beats = play_range / 2.0
                 logger.debug(f'Clip length: legacy match play={play_range} -> {beats} beats (/2)')
-            return max(1.0, min(beats, 256.0))
+            return max(1.0, min(beats, _MAX_CLIP_LENGTH_BEATS))
         beats = play_range / 2.0
         logger.debug(f'Clip length: arrangement fallback play_range={play_range} -> {beats} beats (/2)')
-        return max(1.0, min(beats, 256.0))
+        return max(1.0, min(beats, _MAX_CLIP_LENGTH_BEATS))
 
     if play_range > 0:
         beats = play_range / 2.0
-        return max(1.0, min(beats, 256.0))
+        return max(1.0, min(beats, _MAX_CLIP_LENGTH_BEATS))
     return 1.0
 
 
-def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=None, unquantised=False, expected_seq_params=None):
+def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=None, unquantised=False, expected_seq_params=None,
+                            als_major_version=None):
     """
     Create Blackbox sequences from MIDI tracks using firmware 2.3+ format.
     Each MIDI track can have up to 4 clips mapped to sub-layers A/B/C/D.
@@ -2653,7 +2686,8 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
             clip_for_length = length_clip if length_clip is not None else midi_clip
             if clip_for_length:
                 clip_length_beats = _clip_length_beats_from_midi_clip(
-                    clip_for_length, extracted_note_count=len(sublayer_events)
+                    clip_for_length, extracted_note_count=len(sublayer_events),
+                    als_major_version=als_major_version,
                 )
                 logger.info(
                     f'    Sub-layer {chr(65+sublayer_idx)}: clip_length_beats={clip_length_beats:.2f} '
@@ -3279,6 +3313,15 @@ def make_song_from_sections(root, sections, pad_list, midi_tracks):
             ET.SubElement(sequence, 'seqevent', attrib={
                 'step': '0', 'chan': '15', 'type': 'sceneitem', 'silayer': '4', 'cond': '0',
             })
+        # Silayer 4 pad extensions (e.g. cond=2 Keep) — see golden FIX rows after terminator.
+        for pad_ix in range(num_pads):
+            c4 = int(extracted_pad_conds.get((pad_ix, 4), 0) or 0)
+            if c4 < 1:
+                continue
+            ET.SubElement(sequence, 'seqevent', attrib={
+                'step': '0', 'chan': str(pad_ix), 'type': 'sceneitem',
+                'silayer': '4', 'cond': str(c4),
+            })
 
     # Expected preset has 32 section cells: 8 named + 24 empty (rows 8-31)
     num_named = len(sections)
@@ -3408,6 +3451,7 @@ def parse_locator_name(raw_name):
       - \"Section, Play Count: 16\"
       - \"Section Play Count:16\"
       - \"Section, Playcount : 16\"
+      - \"4 Drop Loop\" (leading number = play count; section title only in Live)
 
     If no play count is found, defaults to 1.
     """
@@ -3440,6 +3484,24 @@ def parse_locator_name(raw_name):
         except ValueError:
             repeats = 1
         return base, max(1, repeats)
+
+    # Pattern 3: "<n> Drop Loop" — play count often only in the title (no ", N" suffix in Live)
+    m = re.match(r'^(\d+)\s+Drop\s+Loop\s*$', name, re.IGNORECASE)
+    if m:
+        try:
+            repeats = int(m.group(1))
+        except ValueError:
+            repeats = 1
+        repeats = max(1, repeats)
+        # #region agent log
+        _dbg(
+            'xml_read.py:parse_locator_name',
+            'Drop Loop leading count parsed',
+            {'raw': name, 'repeats': repeats},
+            hypothesis='H_locator_drop_loop',
+        )
+        # #endregion
+        return name.strip(), repeats
 
     # No play count suffix recognised
     return name, 1
@@ -3629,6 +3691,101 @@ def _section_for_start(start_time, locators):
     return -1
 
 
+def _first_locator_time_where(locators, predicate):
+    """First locator time (beats) for which predicate(locator_name) is true, or None."""
+    for loc in locators:
+        name = loc.get('name') or ''
+        if not predicate(name):
+            continue
+        try:
+            return float(loc['time'])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _song_mode_drop_anchor_beat(locators):
+    """Earliest section start whose name suggests the main 'drop' (post-intro body)."""
+    return _first_locator_time_where(locators, lambda n: 'drop' in n.lower())
+
+
+def _song_mode_comma_break_bridge_beat(locators):
+    """
+    Locator typical of a multi-part break (e.g. '3,5 Break').
+    Sections at/after this use post-drop carry → pad silayer 4 (Keep) heuristics.
+    """
+    return _first_locator_time_where(
+        locators, lambda n: ',' in n and 'break' in n.lower())
+
+
+def _held_layer_from_intervals(intervals, sec_start, sec_end, tol):
+    """
+    If no clip interval overlaps [sec_start, sec_end), return (st, en, layer) of the last
+    clip that ended at or before sec_start (arrangement 'hold' through a later locator).
+    """
+    if not intervals:
+        return None
+    intervals = sorted(intervals, key=lambda x: (x[0], x[1]))
+    for st, en, ly in intervals:
+        if st < sec_end and en > sec_start:
+            return None
+    ended = [(st, en, ly) for st, en, ly in intervals if en <= sec_start + tol]
+    if not ended:
+        return None
+    st, en, ly = max(ended, key=lambda x: x[1])
+    if sec_start + tol < en:
+        return None
+    later = [x for x in intervals if x[0] > st + 1e-6 and x[0] < sec_end - tol]
+    if later:
+        return None
+    return (st, en, ly)
+
+
+def _clip_color_index(clip):
+    """Return clip color index from Live MidiClip XML, or None if absent."""
+    for el in clip.iter():
+        if el.tag in ('DefaultClipColor', 'ClipColor', 'Color'):
+            for key in ('Index', 'Value'):
+                if key in el.attrib:
+                    try:
+                        return int(float(el.attrib[key]))
+                    except (TypeError, ValueError):
+                        pass
+    return None
+
+
+def _infer_layer_from_adjacent_unnamed(clip, clip_name, prev_resolved, beat_eps=1e-4):
+    """
+    Infer silayer for an arrangement clip with an empty name when it starts exactly where
+    the previous clip ended:
+    - color change → next layer (A then blank/colour-change often means B),
+    - same colour (or unknown) → same layer as previous (continuation).
+    """
+    if (clip_name or '').strip():
+        return None
+    if prev_resolved is None:
+        return None
+    start = _clip_start_time(clip)
+    if start is None:
+        return None
+    try:
+        prev_end = float(prev_resolved['end'])
+        pl = int(prev_resolved['layer'])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if abs(prev_end - float(start)) > beat_eps:
+        return None
+    if pl < 0 or pl > 3:
+        return None
+    c0 = prev_resolved.get('color')
+    c1 = _clip_color_index(clip)
+    if c0 is not None and c1 is not None and c0 != c1:
+        if pl < 3:
+            return pl + 1
+        return None
+    return pl
+
+
 def _get_arrangement_clips(track):
     """Yield MidiClip elements from a track's ArrangerAutomation/Events."""
     for ms in track.iter('MainSequencer'):
@@ -3649,23 +3806,50 @@ def extract_pad_sections(tracks, pad_list, locators, tolerance_beats=0.1,
     """
     For each locator section, produce PAD events from Seq track arrangement clips.
 
-    Convention: each Seq track named 'SeqN' with an arrangement clip named 'A'/'B'/'C'/'D'
-    whose arrangement span **overlaps** a section → PAD ON at (seq_index N-1, silayer = layer).
-    Overlap uses CurrentStart/CurrentEnd so layers that continue across a locator still fire
-    in later sections. 'Keep' clips and unnamed clips produce no PAD event.
+    Uses arrangement **CurrentStart** / **CurrentEnd** (clip spans in beats): a clip contributes
+    to every song section its interval overlaps. **Fresh** clips are those whose start lies at
+    or after the section locator (within tolerance); **carry** clips started in an earlier section.
 
-    pad_conds format: {(seq_index, silayer): cond}  — cond=1 for ON (used with pad_events by index).
+    Convention: clips named 'A'/'B'/… → pad ON cond=1 at (seq_index, silayer) for chosen arms.
+
+    **Fresh non-A vs A:** if any fresh clip in a section is layer B/C/D, only non-A fresh clips
+    are candidates for the primary pad row; carry and dropped fresh-A are resolved below.
+
+    **Seq-track 'Keep'** (and 'A Keep', …): pad **silayer 4** cond=2 on that seq index (Blackbox Keep).
+
+    **Carry layer-A** not in the chosen set: after the first 'drop' locator, if the section is at
+    or after the **comma-break** bridge locator (e.g. '3,5 Break'), emit **Keep** on silayer 4;
+    otherwise emit layer A ON (e.g. Break full + drums).
+
+    **Fresh layer-A** dropped by the non-A filter: at/after the bridge locator → silayer 4 Keep;
+    before the bridge → layer A ON (e.g. Bass Full + Seq3 when Seq15 arms B).
+
+    Unnamed clips: same beat as previous clip end → same layer if colour matches, else advance;
+    leading unnamed block on a track → layer A so timeline/colour can chain (e.g. Seq16 → B).
     """
     empty = [{'pad_conds': {}} for _ in locators]
     if not locators or midi_tracks is None:
         return empty
 
     result = [{'pad_conds': {}} for _ in locators]
+    pending = [[] for _ in locators]
+    tol = max(float(tolerance_beats or 0.0), 1e-9)
+    drop_anchor = _song_mode_drop_anchor_beat(locators)
+    bridge_beat = _song_mode_comma_break_bridge_beat(locators)
+    track_layer_intervals = [[] for _ in range(16)]
 
     for enum_index, track in enumerate(midi_tracks[:16]):
         seq_index = _seq_index_from_track(track, enum_index, midi_track_info)
 
-        for clip in _get_arrangement_clips(track):
+        clips = sorted(
+            list(_get_arrangement_clips(track)),
+            key=lambda c: (
+                _clip_start_time(c) if _clip_start_time(c) is not None else float('-inf'),
+                _clip_end_time(c) if _clip_end_time(c) is not None else float('inf'),
+            ),
+        )
+        prev_resolved = None
+        for clip in clips:
             start_time = _clip_start_time(clip)
             if start_time is None:
                 continue
@@ -3674,21 +3858,179 @@ def extract_pad_sections(tracks, pad_list, locators, tolerance_beats=0.1,
             clip_name = name_el.attrib.get('Value', '') if name_el is not None else ''
             action = parse_seq_scene_action(clip_name)
 
-            # Only named-layer clips (A/B/C/D) produce PAD events.
-            # 'Keep' clips and unnamed clips do not trigger a pad in song mode.
-            if action is None or action[0] != 'layer':
+            if action is not None and action[0] == 'keep':
+                end_time = _clip_end_time(clip)
+                if end_time is None:
+                    end_time = start_time + 1e-6
+                for sec_idx in _sections_overlapping_range(start_time, end_time, locators):
+                    result[sec_idx]['pad_conds'][(seq_index, 4)] = 2
+                prev_resolved = None
                 continue
-            layer_idx = action[1]
+
+            layer_idx = None
+            if action is not None and action[0] == 'layer':
+                layer_idx = action[1]
+            else:
+                inferred_layer = _infer_layer_from_adjacent_unnamed(
+                    clip, clip_name, prev_resolved)
+                if inferred_layer is not None:
+                    layer_idx = inferred_layer
+                    # #region agent log
+                    _dbg(
+                        'xml_read.py:extract_pad_sections',
+                        'inferred silayer from unnamed adjacent clip',
+                        {
+                            'seq_index': seq_index,
+                            'inferred_silayer': layer_idx,
+                            'start': start_time,
+                            'end': _clip_end_time(clip),
+                            'prev_layer': prev_resolved.get('layer')
+                            if prev_resolved else None,
+                            'prev_color': prev_resolved.get('color')
+                            if prev_resolved else None,
+                            'clip_color': _clip_color_index(clip),
+                        },
+                        hypothesis='H_unnamed_adjacent_layer',
+                    )
+                    # #endregion
+                elif not (clip_name or '').strip() and prev_resolved is None:
+                    layer_idx = 0
+
+            if layer_idx is None:
+                prev_resolved = None
+                continue
 
             end_time = _clip_end_time(clip)
             if end_time is None:
                 end_time = start_time + 1e-6
             for sec_idx in _sections_overlapping_range(start_time, end_time, locators):
-                result[sec_idx]['pad_conds'][(seq_index, layer_idx)] = 1
-                logger.debug(
-                    f'  Song: Seq{seq_index+1} clip "{clip_name}" [{start_time:g},{end_time:g}) '
-                    f'→ PAD ON section {sec_idx} silayer={layer_idx}'
+                pending[sec_idx].append(
+                    (seq_index, layer_idx, start_time, end_time, clip_name)
                 )
+            track_layer_intervals[enum_index].append((start_time, end_time, layer_idx))
+
+            prev_resolved = {
+                'end': end_time,
+                'layer': layer_idx,
+                'color': _clip_color_index(clip),
+            }
+
+    for sec_idx in range(len(locators)):
+        sec_start = locators[sec_idx]['time']
+        sec_end = (
+            locators[sec_idx + 1]['time'] if sec_idx + 1 < len(locators) else float('inf')
+        )
+        have_seq = {x[0] for x in pending[sec_idx]}
+        for seq_index in range(16):
+            if seq_index in have_seq:
+                continue
+            iv = _held_layer_from_intervals(
+                track_layer_intervals[seq_index],
+                sec_start,
+                sec_end,
+                tol,
+            )
+            if iv is None:
+                continue
+            st, en, ly = iv
+            pending[sec_idx].append((seq_index, ly, st, en, ''))
+
+    for sec_idx, overlapping in enumerate(pending):
+        if not overlapping:
+            continue
+        sec_start = locators[sec_idx]['time']
+        fresh = [x for x in overlapping if x[2] + tol >= sec_start]
+        if not fresh:
+            chosen = overlapping
+        elif any(x[1] > 0 for x in fresh):
+            chosen = [x for x in fresh if x[1] > 0]
+        else:
+            chosen = fresh
+
+        o_set = {(x[0], x[1]) for x in overlapping}
+        c_set = {(x[0], x[1]) for x in chosen}
+        # #region agent log
+        if o_set != c_set:
+            _dbg(
+                'xml_read.py:extract_pad_sections',
+                'fresh-start / layer filter applied',
+                {
+                    'sec_idx': sec_idx,
+                    'section': locators[sec_idx].get('name', ''),
+                    'sec_start': sec_start,
+                    'overlapping': sorted(o_set),
+                    'chosen': sorted(c_set),
+                },
+                hypothesis='H_fresh_pad_filter',
+            )
+        # #endregion
+
+        pc = result[sec_idx]['pad_conds']
+        chosen_pairs = {(x[0], x[1]) for x in chosen}
+
+        seen = set()
+        for seq_index, layer_idx, start_time, end_time, clip_name in chosen:
+            key = (seq_index, layer_idx)
+            if key in seen:
+                continue
+            seen.add(key)
+            pc[key] = 1
+            logger.debug(
+                f'  Song: Seq{seq_index+1} clip "{clip_name}" [{start_time:g},{end_time:g}) '
+                f'→ PAD ON section {sec_idx} silayer={layer_idx}'
+            )
+
+        used_non_a_fresh_filter = bool(fresh) and any(x[1] > 0 for x in fresh)
+        if used_non_a_fresh_filter:
+            for seq_index, layer_idx, _, _, _ in fresh:
+                if layer_idx != 0:
+                    continue
+                if (seq_index, 0) in chosen_pairs:
+                    continue
+                if bridge_beat is not None and sec_start + tol >= bridge_beat:
+                    pc[(seq_index, 4)] = 2
+                else:
+                    pc[(seq_index, 0)] = 1
+
+        by_seq = {}
+        for seq_index, layer_idx, st, en, _nm in overlapping:
+            if layer_idx != 0:
+                continue
+            if st - tol <= sec_start < en:
+                prev = by_seq.get(seq_index)
+                if prev is None or st > prev[0]:
+                    by_seq[seq_index] = (st, en, layer_idx)
+
+        narrow_pre_drop = (
+            drop_anchor is not None
+            and sec_start + tol < drop_anchor
+            and bool(fresh)
+            and (not any(x[1] > 0 for x in fresh))
+            and len(fresh) == 1
+            and fresh[0][1] == 0
+            and fresh[0][0] >= 12
+        )
+        sec_name_low = (locators[sec_idx].get('name') or '').lower()
+
+        for seq_index, (st, en, _ly) in by_seq.items():
+            if (seq_index, 0) in chosen_pairs or (seq_index, 0) in pc or (seq_index, 4) in pc:
+                continue
+            is_fresh = st + tol >= sec_start
+            if is_fresh:
+                continue
+            post_drop = (
+                drop_anchor is not None
+                and bridge_beat is not None
+                and sec_start + tol >= bridge_beat
+                and st + tol >= drop_anchor
+                and 'outro' not in sec_name_low
+            )
+            if narrow_pre_drop and seq_index == 0:
+                continue
+            if post_drop:
+                pc[(seq_index, 4)] = 2
+            else:
+                pc[(seq_index, 0)] = 1
 
     return result
 
@@ -3953,7 +4295,7 @@ def _sections_from_expected_preset(expected_path, num_pads=16, num_seqs=16):
         # Preserve (pad_idx, silayer) keys — make_song_from_sections expects this format.
         pad_conds = {}
         for pad_idx in range(num_pads):
-            for silayer in range(4):
+            for silayer in range(5):
                 c = sec['pad_conds'].get((pad_idx, silayer), 0)
                 if c >= 1:
                     pad_conds[(pad_idx, silayer)] = c
@@ -3972,10 +4314,11 @@ def _sections_from_expected_preset(expected_path, num_pads=16, num_seqs=16):
     return out
 
 
-def compare_section_content(expected_preset_path, actual_preset_path, max_sections=8):
+def compare_section_content(expected_preset_path, actual_preset_path, max_sections=None):
     """
     Compare song section content (name, repeats, pad/seq conds) between expected and actual preset XML.
     Logs differences and returns number of mismatches.
+    If max_sections is None, compare all sections present in both files (up to shared length).
     """
     try:
         with open(expected_preset_path, 'r') as f:
@@ -3998,7 +4341,9 @@ def compare_section_content(expected_preset_path, actual_preset_path, max_sectio
 
     exp_sec = _section_content_from_root(exp_root)
     act_sec = _section_content_from_root(act_root)
-    n = min(max_sections, len(exp_sec), len(act_sec))
+    n = min(len(exp_sec), len(act_sec))
+    if max_sections is not None:
+        n = min(n, int(max_sections))
     mismatches = 0
     logger.info('=== Song section content comparison (expected vs actual, human indexing Pad 1–16, Seq 1–16) ===')
     for i in range(n):
@@ -4042,6 +4387,11 @@ def main(args):
     
     try:
         root = read_project(args.Input)
+        als_major_version = None
+        try:
+            als_major_version = int(str(root.attrib.get('MajorVersion', '') or '0'))
+        except (ValueError, TypeError):
+            als_major_version = None
         tracks, tempo = track_tempo_extractor(root)
         logger.info(f'The project tempo is: {tempo} bpm')
         
@@ -4069,7 +4419,10 @@ def main(args):
         
         # Create sequences from MIDI tracks
         expected_seq_params = _load_expected_sequence_params(args.compare) if getattr(args, 'compare', None) else None
-        session = make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info, unquantised=args.unquantised, expected_seq_params=expected_seq_params)
+        session = make_drum_rack_sequences(
+            session, midi_tracks, pad_list, midi_track_info, unquantised=args.unquantised,
+            expected_seq_params=expected_seq_params, als_major_version=als_major_version,
+        )
         
         # Build song sections (optional song mode)
         song_sections = []
@@ -4134,7 +4487,7 @@ def main(args):
         save_xml(bb_root, preset_filepath)
         
         if getattr(args, 'compare', None):
-            compare_section_content(args.compare, preset_filepath, max_sections=8)
+            compare_section_content(args.compare, preset_filepath)
         
         logger.info('=== Conversion complete! ===')
         logger.info(f'Output saved to: {args.Output}')
@@ -4174,7 +4527,12 @@ if __name__ == '__main__':
     parser.add_argument("-m", "--Manual", help="Manual sample extraction (don't copy samples)", action='store_true')
     parser.add_argument("-u", "--unquantised", help="Unquantised MIDI timing (precise timing, not grid-locked)", action='store_true')
     parser.add_argument("-s", "--song-mode", help="Enable song mode: map arrangement locators and clips to Blackbox song sections", action='store_true')
-    parser.add_argument("-c", "--compare", help="After conversion, compare section content (name, repeats, pad/seq ON) to this expected preset XML path. When used with -s, also uses the expected preset's song layout as source of truth.", type=str, default=None)
+    parser.add_argument(
+        "-c", "--compare",
+        help="Optional: compare song section content to this preset after conversion. "
+             "With -s, may also copy expected pad_conds/seq_conds/repeats for regression; "
+             "normal song mode is derived from the .als arrangement only.",
+        type=str, default=None)
     parser.add_argument("-v", "--verbose", help="Verbose output", action='store_true')
     args = parser.parse_args()
     
