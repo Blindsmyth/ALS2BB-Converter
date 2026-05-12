@@ -5,16 +5,12 @@ comparison to a spreadsheet (e.g. 8X4 = 8 bars per pass × section repeats 4).
 
 Repeats: from section cell <params sectionrepeats="N"> (locator play count in the ALS).
 
-Bars (one pass) — **sceneitem** `cond` 1 = ON, **2** = Keep:
+Bars (one pass), matching Blackbox-style “longest pattern driving this section”:
 
-  • **Pad** arms (`chan` 0–15): length = `noteseq` at that `(slot, silayer)`.
-
-  • **Seq** arms (`chan` 256–271): slot = chan − 256.
-    - **cond 1 (ON)**: max length over **all** sublayers on that slot (new seq fire).
-    - **cond 2 (Keep)**: if this slot also has a **pad** scene **cond 1** on the same slot,
-      the pad picks an explicit layer — use **that** `silayer` only (pairs with Melo: pad 12
-      layer B + seq Keep layer A → 16 bars). Otherwise use **max over sublayers** (latched
-      “full” patterns on bass trio slots → 48 bars for 3,5 Break / transition).
+  • **Scene arms** (pads or seq channels): each sceneitem with `cond` 1 or 2 contributes
+    `(grid_slot, silayer)`. **silayer** selects the `noteseq` sublayer on that slot (same as
+    firmware). Seq Keep on e.g. chan 268 with `silayer="0"` reads only sublayer 0, not the
+    longest pattern on other sublayers of that slot.
 
 Section **bar length** from the Live timeline alone is not stored in `preset.xml`; if bars
 still disagree with your sheet (e.g. break = 16 vs longest pad pattern = 8), pass a future
@@ -128,49 +124,18 @@ def _max_bars_at_pad_silayer(
     return best
 
 
-def _max_bars_all_sublayers_slot(
-    pad_idx: int,
-    noteseq_index: dict[tuple[int, int, int], list[tuple[int, dict]]],
-) -> float:
-    """Longest noteseq on this grid cell across A–D (all seqsublayers)."""
-    row, col = _row_column(pad_idx)
-    best = 0.0
-    for sub in range(4):
-        for nsc, pattr in noteseq_index.get((row, col, sub), []):
-            sl = pattr.get("notesteplen", "10")
-            b = _notestepcount_to_bars(nsc, sl)
-            if b > best:
-                best = b
-    return best
+def _armed_grid_layers_from_section(seq_el: ET.Element | None) -> set[tuple[int, int]]:
+    """
+    (grid_slot 0–15, silayer 0–3) for every pad or seq scene ON/Keep.
 
+    Pad events: chan omitted → slot 0; chan 0–15 → that pad index.
+    Seq events: chan 256–271 → slot (chan - 256).
 
-def _slots_pad_scene_on(seq_el: ET.Element | None) -> set[int]:
-    """Grid slots (0–15) with pad scene cond==1 (explicit pad ON). seq channels excluded."""
-    out: set[int] = set()
+    silayer selects which seqsublayer / pattern (A–D) applies.
+    """
+    armed: set[tuple[int, int]] = set()
     if seq_el is None:
-        return out
-    for ev in seq_el.findall("seqevent"):
-        if ev.get("type") != "sceneitem" or ev.get("cond", "0") != "1":
-            continue
-        ch = ev.get("chan")
-        if ch is None or ch == "":
-            out.add(0)
-            continue
-        try:
-            ci = int(ch)
-        except ValueError:
-            continue
-        if 0 <= ci <= 15:
-            out.add(ci)
-    return out
-
-
-def _max_bars_from_scene(seq_el: ET.Element | None, noteseq_index: dict[tuple[int, int, int], list[tuple[int, dict]]]) -> float:
-    """Max length implied by all pad+seq scene arms (ON/Keep) in this section."""
-    if seq_el is None:
-        return 0.0
-    slots_pad_on = _slots_pad_scene_on(seq_el)
-    best = 0.0
+        return armed
     for ev in seq_el.findall("seqevent"):
         if ev.get("type") != "sceneitem":
             continue
@@ -185,64 +150,39 @@ def _max_bars_from_scene(seq_el: ET.Element | None, noteseq_index: dict[tuple[in
             silayer = 0
         ch = ev.get("chan")
         if ch is None or ch == "":
-            slot, is_seq = 0, False
-        else:
-            try:
-                ci = int(ch)
-            except ValueError:
-                continue
-            if 0 <= ci <= 15:
-                slot, is_seq = ci, False
-            elif 256 <= ci <= 271:
-                slot, is_seq = ci - 256, True
-            else:
-                continue
-        if is_seq:
-            if cond == "1":
-                b = _max_bars_all_sublayers_slot(slot, noteseq_index)
-            else:
-                if slot in slots_pad_on:
-                    b = _max_bars_at_pad_silayer(slot, silayer, noteseq_index)
-                else:
-                    b = _max_bars_all_sublayers_slot(slot, noteseq_index)
-        else:
-            b = _max_bars_at_pad_silayer(slot, silayer, noteseq_index)
-        if b > best:
-            best = b
-    return best
+            armed.add((0, silayer))
+            continue
+        try:
+            ci = int(ch)
+        except ValueError:
+            continue
+        if 0 <= ci <= 15:
+            armed.add((ci, silayer))
+        elif 256 <= ci <= 271:
+            armed.add((ci - 256, silayer))
+    return armed
 
 
-def _armed_layers_from_section_debug(seq_el: ET.Element | None) -> list[tuple[int, int, str, str]]:
-    """Debug: (slot, silayer, pad|seq, ON|Keep) in document order — simplified cond label."""
-    rows: list[tuple[int, int, str, str]] = []
+def _armed_seq_slots_from_section(seq_el: ET.Element | None) -> set[int]:
+    """Seq indices (0–15) that have cond 1/2 on chan 256–271 (for debug column)."""
+    out: set[int] = set()
     if seq_el is None:
-        return rows
+        return out
     for ev in seq_el.findall("seqevent"):
         if ev.get("type") != "sceneitem":
             continue
-        cond = ev.get("cond", "0")
-        if cond not in ("1", "2"):
+        if ev.get("cond", "0") not in ("1", "2"):
             continue
-        try:
-            silayer = int(ev.get("silayer", "0") or 0)
-        except ValueError:
-            silayer = 0
         ch = ev.get("chan")
         if ch is None or ch == "":
-            slot, kind = 0, "pad"
-        else:
-            try:
-                ci = int(ch)
-            except ValueError:
-                continue
-            if 0 <= ci <= 15:
-                slot, kind = ci, "pad"
-            elif 256 <= ci <= 271:
-                slot, kind = ci - 256, "seq"
-            else:
-                continue
-        rows.append((slot, silayer, kind, "ON" if cond == "1" else "Keep"))
-    return rows
+            continue
+        try:
+            ci = int(ch)
+        except ValueError:
+            continue
+        if 256 <= ci <= 271:
+            out.add(ci - 256)
+    return out
 
 
 def _sections_report(root: ET.Element) -> list[dict]:
@@ -267,9 +207,10 @@ def _sections_report(root: ET.Element) -> list[dict]:
         except ValueError:
             repeats = 1
         seq = cell.find("sequence")
-        max_bars = _max_bars_from_scene(seq, noteseq_index)
-        armed_seqs = sorted({s for s, _, k, _ in _armed_layers_from_section_debug(seq) if k == "seq"})
-        armed_layers_dbg = _armed_layers_from_section_debug(seq)
+        armed_layers = _armed_grid_layers_from_section(seq)
+        max_bars = 0.0
+        for grid_slot, sl in armed_layers:
+            max_bars = max(max_bars, _max_bars_at_pad_silayer(grid_slot, sl, noteseq_index))
         # Integer bars for display when close to whole bars
         bars_disp = int(round(max_bars)) if abs(max_bars - round(max_bars)) < 0.05 else round(max_bars, 2)
         report.append(
@@ -280,8 +221,8 @@ def _sections_report(root: ET.Element) -> list[dict]:
                 "max_bars": max_bars,
                 "bars_disp": bars_disp,
                 "label": f"{bars_disp}X{repeats}",
-                "armed_seqs": armed_seqs,
-                "armed_layers": armed_layers_dbg,
+                "armed_seqs": sorted(_armed_seq_slots_from_section(seq)),
+                "armed_layers": sorted(armed_layers),
             }
         )
     return report
