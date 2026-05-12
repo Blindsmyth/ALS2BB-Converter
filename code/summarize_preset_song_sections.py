@@ -5,10 +5,19 @@ comparison to a spreadsheet (e.g. 8X4 = 8 bars per pass × section repeats 4).
 
 Repeats: from section cell <params sectionrepeats="N"> (locator play count in the ALS).
 
-Bars (one pass): max over **armed sequence** slots (sceneitem cond 1 or 2 on chan 256–271) of
-bars from `notestepcount` / `notesteplen` (converter formula, 4/4). Pad-only sections show 0
-here — your spreadsheet "8" may come from Live timeline or sample length; that is not
-reliably the same as Blackbox `beatcount` on long stems.
+Bars (one pass), matching Blackbox-style “longest pattern driving this section”:
+
+  • **Seq scene arms**: sceneitem `cond` 1 or 2 on `chan` 256–271 → use sequences on those
+    seq slots (grid cell for Seq N), same as before.
+
+    • **Pad scene arms**: sceneitem `cond` 1 or 2 on pad `chan` 0–15 (missing `chan` = pad 0).
+    Use that event’s **silayer** as the seqsublayer on the pad’s grid cell (same row/col as the
+    pad). Example: Bass Full arms pad 15 (`chan="14"`) with `silayer="1"` → read the `noteseq`
+    at that cell with `seqsublayer="1"` (often the 192-step / steplen 6 pattern ⇒ **48** bars).
+
+Section **bar length** from the Live timeline alone is not stored in `preset.xml`; if bars
+still disagree with your sheet (e.g. break = 16 vs longest pad pattern = 8), pass a future
+`--als` mode or compare locator span separately.
 
 Usage:
   python3 summarize_preset_song_sections.py path/to/preset.xml
@@ -98,6 +107,24 @@ def _notestepcount_to_bars(notestepcount: int, notesteplen: str) -> float:
     return float(notestepcount) / steps_per_bar
 
 
+def _max_bars_at_pad_silayer(
+    pad_idx: int,
+    silayer: int,
+    noteseq_index: dict[tuple[int, int, int], list[tuple[int, dict]]],
+) -> float:
+    """Longest pattern on this pad grid cell for one seqsublayer (matches scene silayer)."""
+    row, col = _row_column(pad_idx)
+    if not (0 <= silayer <= 3):
+        silayer = 0
+    best = 0.0
+    for nsc, pattr in noteseq_index.get((row, col, silayer), []):
+        sl = pattr.get("notesteplen", "10")
+        b = _notestepcount_to_bars(nsc, sl)
+        if b > best:
+            best = b
+    return best
+
+
 def _max_bars_for_seq_slot(
     seq_index: int,
     noteseq_index: dict[tuple[int, int, int], list[tuple[int, dict]]],
@@ -111,6 +138,34 @@ def _max_bars_for_seq_slot(
             if b > best:
                 best = b
     return best
+
+
+def _armed_pad_layers_from_section(seq_el: ET.Element | None) -> set[tuple[int, int]]:
+    """(pad_index, silayer) pairs with scene ON/Keep on pads. silayer matches noteseq seqsublayer."""
+    armed: set[tuple[int, int]] = set()
+    if seq_el is None:
+        return armed
+    for ev in seq_el.findall("seqevent"):
+        if ev.get("type") != "sceneitem":
+            continue
+        cond = ev.get("cond", "0")
+        if cond not in ("1", "2"):
+            continue
+        try:
+            silayer = int(ev.get("silayer", "0") or 0)
+        except ValueError:
+            silayer = 0
+        ch = ev.get("chan")
+        if ch is None or ch == "":
+            armed.add((0, silayer))
+            continue
+        try:
+            ci = int(ch)
+        except ValueError:
+            continue
+        if 0 <= ci <= 15:
+            armed.add((ci, silayer))
+    return armed
 
 
 def _sections_report(root: ET.Element) -> list[dict]:
@@ -152,10 +207,14 @@ def _sections_report(root: ET.Element) -> list[dict]:
                     continue
                 if 256 <= ci <= 271:
                     armed_seq.add(ci - 256)
+        armed_pad_layers = _armed_pad_layers_from_section(seq)
         max_seq_bars = 0.0
         for sidx in armed_seq:
             max_seq_bars = max(max_seq_bars, _max_bars_for_seq_slot(sidx, noteseq_index))
-        max_bars = max_seq_bars
+        max_pad_bars = 0.0
+        for p, sl in armed_pad_layers:
+            max_pad_bars = max(max_pad_bars, _max_bars_at_pad_silayer(p, sl, noteseq_index))
+        max_bars = max(max_seq_bars, max_pad_bars)
         # Integer bars for display when close to whole bars
         bars_disp = int(round(max_bars)) if abs(max_bars - round(max_bars)) < 0.05 else round(max_bars, 2)
         report.append(
@@ -167,6 +226,7 @@ def _sections_report(root: ET.Element) -> list[dict]:
                 "bars_disp": bars_disp,
                 "label": f"{bars_disp}X{repeats}",
                 "armed_seqs": sorted(armed_seq),
+                "armed_pad_layers": sorted(armed_pad_layers),
             }
         )
     return report
@@ -174,12 +234,16 @@ def _sections_report(root: ET.Element) -> list[dict]:
 
 def _print_report(path: str, rep: list[dict]) -> None:
     print(f"# {path}")
-    print("row\tname\tbars\trepeats\tbarsXrepeats\tarmed_seqs(0-based)  [seq-only; pad-only sections show 0]")
+    print(
+        "row\tname\tbars\trepeats\tbarsXrepeats\tarmed_seqs(0-based)\tarmed_pad_layers(pad,silayer)  "
+        "[bars = max(seq-slot max, each armed pad+silayer cell)]"
+    )
     for r in rep:
         if not r["name"] and r["row"] >= 8 and r["max_bars"] == 0 and r["repeats"] == 1:
             continue  # skip trailing empty padding rows
         print(
-            f"{r['row']}\t{r['name']!r}\t{r['bars_disp']}\t{r['repeats']}\t{r['label']}\t{r['armed_seqs']}"
+            f"{r['row']}\t{r['name']!r}\t{r['bars_disp']}\t{r['repeats']}\t{r['label']}\t"
+            f"{r['armed_seqs']}\t{r['armed_pad_layers']}"
         )
 
 
