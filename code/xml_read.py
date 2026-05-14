@@ -104,9 +104,14 @@ def _parse_slice_point_container(container):
 def limit_slice_positions_density_priority(positions, max_count, samlen_int=None):
     """
     Reduce slice onset count while preferring regions where onsets are dense (short gaps).
-    Always keeps the first and last onset; fills remaining slots with highest-scoring interiors.
+    Always keeps the first and last onset from the input list; fills remaining slots with
+    highest-scoring interiors.
 
     Used for beta clip-mode transient embeds (hardware / MIDI practical limit).
+
+    Does NOT inject an artificial slice at sample 0: if Ableton provided no onset at the
+    start (Frozen_Git-style), omitting pos 0 avoids a bogus first slice; if Live saved a
+    real slice at 0, it remains in the input and is kept like any other onset.
     """
     if max_count < 1:
         return []
@@ -116,9 +121,6 @@ def limit_slice_positions_density_priority(positions, max_count, samlen_int=None
     if samlen_int is not None and samlen_int > 0:
         uniq = [min(p, samlen_int) for p in uniq]
         uniq = sorted(set(uniq))
-    if 0 not in uniq:
-        uniq.insert(0, 0)
-        uniq.sort()
     if len(uniq) <= max_count:
         return uniq
     first, last = uniq[0], uniq[-1]
@@ -1926,6 +1928,33 @@ def make_drum_rack_pads(session, pad_list, tempo, project_label=''):
     return session, assets
 
 
+def _tick_distance_to_grid(tick_pos, grid_ticks):
+    """Distance from tick_pos to the nearest multiple of grid_ticks (0 .. grid_ticks//2)."""
+    if grid_ticks <= 0:
+        return 0
+    r = int(tick_pos) % grid_ticks
+    return min(r, grid_ticks - r)
+
+
+def _tick_aligns_to_grid(tick_pos, grid_ticks, tolerance_ticks):
+    """True if tick_pos is within tolerance_ticks of an integer multiple of grid_ticks."""
+    return _tick_distance_to_grid(tick_pos, grid_ticks) <= tolerance_ticks
+
+
+def _grid_alignment_tolerance(grid_ticks, is_triplet):
+    """
+    Allowed deviation (ticks at ticks_per_beat=3840) when testing grid alignment.
+
+    Straight grids: tight tolerance (float / export noise only).
+    Triplet grids: wider tolerance so lightly humanised 1/16T / 1/8T grooves still
+    register as triplets and can export quantised (step_len 11/9) instead of
+    falling through to unquantised with straight step_len.
+    """
+    if is_triplet:
+        return max(12, min(grid_ticks // 2 - 1, 72))
+    return max(1, min(4, grid_ticks // 80))
+
+
 def detect_note_grid_pattern(events, ticks_per_beat=3840):
     """
     Detect the note grid pattern and quantization state.
@@ -2019,11 +2048,10 @@ def detect_note_grid_pattern(events, ticks_per_beat=3840):
             continue  # Skip 1/32 if we don't need it
         
         aligned = 0
+        is_triplet_res = step_len in [11, 9]
+        tol = _grid_alignment_tolerance(grid_ticks, is_triplet_res)
         for tick_pos in tick_positions:
-            # Check alignment with small tolerance for rounding errors (within 1 tick)
-            # This handles cases where floating point conversion causes slight offsets
-            remainder = tick_pos % grid_ticks
-            if remainder == 0 or remainder == (grid_ticks - 1) or remainder == 1:
+            if _tick_aligns_to_grid(tick_pos, grid_ticks, tol):
                 aligned += 1
         
         score = aligned / len(tick_positions)
@@ -2057,10 +2085,9 @@ def detect_note_grid_pattern(events, ticks_per_beat=3840):
     triplet_count = 0
     for grid_ticks, step_len, name in triplet_grids:
         aligned = 0
+        tol_t = _grid_alignment_tolerance(grid_ticks, True)
         for tick_pos in tick_positions:
-            # Check alignment with small tolerance for rounding errors (within 1 tick)
-            remainder = tick_pos % grid_ticks
-            if remainder == 0 or remainder == (grid_ticks - 1) or remainder == 1:
+            if _tick_aligns_to_grid(tick_pos, grid_ticks, tol_t):
                 aligned += 1
         score = aligned / len(tick_positions) if len(tick_positions) > 0 else 0
         if aligned > len(tick_positions) * 0.5:  # More than 50% aligned to triplet
@@ -2074,8 +2101,9 @@ def detect_note_grid_pattern(events, ticks_per_beat=3840):
     straight_count = 0
     for grid_ticks, step_len, name in straight_grids:
         aligned = 0
+        tol_s = _grid_alignment_tolerance(grid_ticks, False)
         for tick_pos in tick_positions:
-            if tick_pos % grid_ticks == 0:
+            if _tick_aligns_to_grid(tick_pos, grid_ticks, tol_s):
                 aligned += 1
         if aligned > len(tick_positions) * 0.5:  # More than 50% aligned to straight
             straight_aligned = max(straight_aligned, aligned)
@@ -2094,17 +2122,17 @@ def detect_note_grid_pattern(events, ticks_per_beat=3840):
             aligns_to_triplet = False
             aligns_to_straight = False
             
-            # Check if aligns to any triplet grid (with tolerance for rounding)
+            # Check if aligns to any triplet grid (wider tolerance for humanised triplets)
             for grid_ticks, step_len, name in triplet_grids:
-                remainder = tick_pos % grid_ticks
-                if remainder == 0 or remainder == (grid_ticks - 1) or remainder == 1:
+                tol_t = _grid_alignment_tolerance(grid_ticks, True)
+                if _tick_aligns_to_grid(tick_pos, grid_ticks, tol_t):
                     aligns_to_triplet = True
                     break
             
-            # Check if aligns to any straight grid (with tolerance for rounding)
+            # Check if aligns to any straight grid (tight tolerance)
             for grid_ticks, step_len, name in straight_grids:
-                remainder = tick_pos % grid_ticks
-                if remainder == 0 or remainder == (grid_ticks - 1) or remainder == 1:
+                tol_s = _grid_alignment_tolerance(grid_ticks, False)
+                if _tick_aligns_to_grid(tick_pos, grid_ticks, tol_s):
                     aligns_to_straight = True
                     break
             
@@ -2124,10 +2152,11 @@ def detect_note_grid_pattern(events, ticks_per_beat=3840):
             logger.debug(f'  Grid analysis: Mixed triplets ({triplet_only_ratio*100:.0f}% triplet-only) and straight ({straight_only_ratio*100:.0f}% straight-only) detected')
     
     # CRITICAL: If triplets are detected and have good alignment, prefer triplet step_len
-    # Only do this if triplets are well-aligned (>95%) and NOT mixed with straight notes
+    # Use a slightly lower bar than straight grids: humanised 1/16T often scores 90–94%
+    # with tolerant triplet detection but still beats the straight match.
     # BUT: Prefer straight notes over triplets when both align equally well (default to straight)
     # Mixed patterns must always be unquantised
-    if best_triplet_match and best_triplet_score >= 0.95 and not mixed_pattern:
+    if best_triplet_match and best_triplet_score >= 0.88 and not mixed_pattern:
         # Only use triplet step_len if it's BETTER than the straight match
         # If scores are equal, prefer straight (default behavior)
         # Check if best_match is a straight note grid (not triplet)
@@ -2150,17 +2179,23 @@ def detect_note_grid_pattern(events, ticks_per_beat=3840):
     
     # Determine if unquantised
     # Unquantised if:
-    # 1. Less than 95% aligned to any grid (off-grid timing) - use 95% to allow for rounding errors
+    # 1. Below alignment threshold for the chosen grid (95% straight / 88% triplet — triplets
+    #    use a lower bar because tolerant triplet scoring still reflects a clear triplet intent)
     # 2. Mixed triplets + straight notes (CRITICAL: always unquantised when mixed)
-    is_unquantised = best_score < 0.95 or mixed_pattern
+    quantised_align_threshold = 0.95
+    if best_match and best_match[1] in (11, 9):
+        quantised_align_threshold = 0.88
+    is_unquantised = best_score < quantised_align_threshold or mixed_pattern
     
     if best_match:
         grid_ticks, step_len, grid_name = best_match
         if is_unquantised:
             logger.info(f'  Grid analysis: {best_score*100:.0f}% aligned to {grid_name}, unquantised detected (mixed={mixed_pattern})')
             # Debug: Log why it's unquantised with more detail
-            if best_score < 0.95:
-                logger.debug(f'    Reason: Alignment score {best_score*100:.1f}% < 95% threshold')
+            if best_score < quantised_align_threshold:
+                logger.debug(
+                    f'    Reason: Alignment score {best_score*100:.1f}% < {quantised_align_threshold*100:.0f}% threshold'
+                )
                 # Log sample tick positions for debugging
                 if len(tick_positions) > 0:
                     sample_ticks = tick_positions[:5]
@@ -2704,10 +2739,15 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
             if _midi_clip_has_notes(mc):
                 first_layer_with_notes = si
                 break
+        # Active pattern head on sublayer-0 cells: which A/B/C/D layer the Blackbox treats as
+        # primary for that sequence. Prefer the lowest slot that actually has MIDI (almost always
+        # the main groove on pattern A). Using only the highest arrangement clip index wrongly
+        # selects an overdub layer (e.g. B) while A carries the triplet hat — playback then sounds
+        # sparse/straight vs the full groove (Digital Waterfall Seq2).
+        # When no layer has notes, fall back to arrangement span or 0.
         track_activeseqlayer_head = (
-            arrangement_max_layer_idx
-            if arrangement_max_layer_idx is not None
-            else (first_layer_with_notes if first_layer_with_notes >= 0 else 0)
+            first_layer_with_notes if first_layer_with_notes >= 0
+            else (arrangement_max_layer_idx if arrangement_max_layer_idx is not None else 0)
         )
         
         # Create sequence cells for each sublayer (firmware 2.3+ format)
@@ -3035,6 +3075,16 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                 9: 1.5,  # 1/8T (will round)
             }
             steps_per_beat = steps_per_beat_map.get(step_len, 4)
+
+            # Quantised 1/16 triplets (internal step_len 11): write notesteplen=9 for Blackbox's
+            # triplet-oriented step grid ("8 triplet" UI). strtks uses step_index * (3840/4): with
+            # step_len 9 the firmware maps step/time along that triplet sequence grid — these tick
+            # values are not "straight 16ths" musically; keep step indices from round(beats * 3).
+            notesteplen_written = step_len
+            triplet_quant_strtks_stride = None  # None → use 3840/steps_per_beat triplet lattice ticks
+            if not is_unquantised and step_len == 11:
+                notesteplen_written = 9
+                triplet_quant_strtks_stride = 960
             
             # CRITICAL: Tick rate depends ONLY on quantisation state, NOT on sequence mode
             # Quantised sequences (both Keys and Pads): Use 3840 ticks/beat
@@ -3078,12 +3128,22 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                 for event in sublayer_events:
                     time_val = event.get('time_val', 0)
                     dur_val = event.get('dur_val', 0)
-                    # Recalculate step based on detected step_len (e.g., 8 steps/beat for 1/32 notes)
-                    event['step'] = int(time_val * steps_per_beat)
-                    # Recalculate strtks with 3840 ticks/beat for quantised sequences (both Keys and Pads mode)
+                    if step_len in (11, 9):
+                        # Lock step index to triplet grid (3 or 1.5 steps per beat); strtks uses either
+                        # true triplet spacing or 16th-note ticks for quantised 1/16T export (see above).
+                        spb = float(steps_per_beat)
+                        stride = float(triplet_quant_strtks_stride) if triplet_quant_strtks_stride else (
+                            3840.0 / spb
+                        )
+                        snap_st = round(time_val * spb)
+                        si = int(snap_st)
+                        si = max(0, min(si, max(0, step_count - 1)))
+                        event['step'] = si
+                        event['strtks'] = int(round(si * stride))
+                    else:
+                        event['step'] = int(time_val * steps_per_beat)
+                        event['strtks'] = int(time_val * 3840)  # 3840 ticks/beat for quantised
                     # CRITICAL: For quantised sequences, lentks should be constant 960 ticks (matches reference format)
-                    # This ensures step mode is ON (quantised) on the device
-                    event['strtks'] = int(time_val * 3840)  # 3840 ticks/beat for quantised
                     event['lentks'] = 960  # Constant 960 ticks for quantised sequences (matches reference)
                     # Drum-rack workflow: notes are pad triggers, not sustained gates. All FIX presets
                     # use lencount=1 (1-step gate) regardless of MIDI Duration. dur_val is preserved
@@ -3171,7 +3231,7 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                 dispmode_val = '0'
             
             params.attrib = {
-                'notesteplen': str(step_len),  # Calculated based on clip length
+                'notesteplen': str(notesteplen_written),  # May differ from internal step_len for triplet export
                 'notestepcount': str(step_count),  # Calculated from clip length
                 'dutycyc': '1000',
                 'quantsizeseq': '1',
