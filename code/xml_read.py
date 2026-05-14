@@ -3076,15 +3076,15 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
             }
             steps_per_beat = steps_per_beat_map.get(step_len, 4)
 
-            # Quantised 1/16 triplets (internal step_len 11): write notesteplen=9 for Blackbox's
-            # triplet-oriented step grid ("8 triplet" UI). strtks uses step_index * (3840/4): with
-            # step_len 9 the firmware maps step/time along that triplet sequence grid — these tick
-            # values are not "straight 16ths" musically; keep step indices from round(beats * 3).
+            # Quantised 1/16 triplets (internal step_len 11): write notesteplen=9 ("8 triplet" UI).
+            # Step indices use round(beats * 3). strtks MUST use triplet tick spacing: 3840/3 = 1280
+            # ticks per triplet slot — NOT 960 (960 = ¼ beat = straight 16th spacing on the clock,
+            # which makes the groove sound 16th-locked on hardware despite the triplet grid).
             notesteplen_written = step_len
             triplet_quant_strtks_stride = None  # None → use 3840/steps_per_beat triplet lattice ticks
             if not is_unquantised and step_len == 11:
                 notesteplen_written = 9
-                triplet_quant_strtks_stride = 960
+                triplet_quant_strtks_stride = 1280
             
             # CRITICAL: Tick rate depends ONLY on quantisation state, NOT on sequence mode
             # Quantised sequences (both Keys and Pads): Use 3840 ticks/beat
@@ -3129,8 +3129,8 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                     time_val = event.get('time_val', 0)
                     dur_val = event.get('dur_val', 0)
                     if step_len in (11, 9):
-                        # Lock step index to triplet grid (3 or 1.5 steps per beat); strtks uses either
-                        # true triplet spacing or 16th-note ticks for quantised 1/16T export (see above).
+                        # Lock step index to triplet grid; strtks uses true triplet ticks on the
+                        # 3840/beat clock (1280 per 1/16-triplet slot when exporting steplen 9).
                         spb = float(steps_per_beat)
                         stride = float(triplet_quant_strtks_stride) if triplet_quant_strtks_stride else (
                             3840.0 / spb
