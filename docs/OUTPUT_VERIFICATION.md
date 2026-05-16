@@ -57,7 +57,7 @@ Multiple different pitches (36, 37, 40) → Keys display → wrong for drum pad 
 ## When to Run Verification
 
 1. **When fixing sequence mode bugs** (e.g. "seq 13–16 showing as Keys"): Run conversion, then inspect the output XML for the affected cells (row/column from track index) and confirm single pitch per cell.
-2. **Before merging or pushing**: If an expected preset exists, run with `-c <path>`. Also spot-check noteseq cells for pitch consistency when the fix touches sequence logic.
+2. **Before merging or pushing**: Diff your new `preset.xml` against a reference golden preset if you keep one. Spot-check noteseq cells for pitch consistency when the fix touches sequence logic.
 3. **After any change to** `make_drum_rack_sequences`, `event_pitch`, `event_chan`, or note filtering.
 
 ## Checklist for Sequence Mode Fixes
