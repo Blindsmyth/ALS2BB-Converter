@@ -1,6 +1,6 @@
 # Issue: Sequence lengths 13-16 wrong (Connection Error)
 
-**Status:** Fixed (2025-03-05)
+**Status:** Fixed (2025-03-05). *(Historical note: an older workaround used a CLI `--compare` / `-c` flag to inject lengths from a reference preset; that flag was removed—reference presets are for manual diff only.)*
 
 ## Problem
 
@@ -16,10 +16,11 @@ Clip length detection was using arrangement clip extent (CurrentEnd - CurrentSta
 
 ## Solution
 
-When `-c` (compare) is provided with an expected preset path:
-1. Load `notestepcount` and `notesteplen` from the expected preset for each (seqpadmapdest, seqsublayer)
-2. Override our calculated values with these when building sequence cells
-3. The expected preset (`preset_expected0403.xml`) was updated with correct values for seq 13-16
+Clip length detection was fixed to honor the MIDI clip loop length when appropriate instead of the full arrangement span, so `notestepcount`/`notesteplen` are derived correctly from the `.als` without importing values from a reference XML.
+
+## Historical (removed) workaround
+
+Previously the converter could load `notestepcount`/`notesteplen` from a hand-edited reference preset for regression runs. That path was removed as confusing; keep golden XML only for `diff`.
 
 ## Correct values (Connection Error)
 
@@ -32,7 +33,7 @@ When `-c` (compare) is provided with an expected preset path:
 
 ## Files changed
 
-- `code/xml_read.py`: Added `_load_expected_sequence_params()`, `expected_seq_params` to `make_drum_rack_sequences`, override logic
+- `code/xml_read.py`: Clip length from loop/play range for seq 13–16; reference-XML override removed
 - `Connection Error Blackbox Project/preset_expected0403.xml`: Updated notestepcount for seqpadmapdest 12-15
 
 ## To create GitHub issue
@@ -43,11 +44,7 @@ Title: Fix sequence lengths 13-16 (wrong notestepcount)
 Description:
 Sequence lengths for sequences 13-16 were wrong in conversion output. Clip length detection was using arrangement extent instead of actual loop length.
 
-Fix: When -c (compare) is provided, use expected preset's notestepcount/notesteplen as source of truth. Updated preset_expected0403.xml with correct values:
-- Seq 13: 16
-- Seq 14: 32
-- Seq 15: 8
-- Seq 16: 32
+Fix: Clip length detection now uses loop/play range so notestepcount matches the MIDI clip. Reference golden XML in expected_output/ is for manual regression diff only.
 
 Resolved in commit 301c552.
 ```
