@@ -2624,7 +2624,8 @@ def detect_note_grid_pattern(events, ticks_per_beat=3840):
         'step_len': step_len if not is_unquantised else 10,  # Use detected step_len only if quantised
         'has_triplets': triplet_aligned > 0,
         'has_straight': straight_aligned > 0,
-        'grid_resolution': grid_ticks if best_match else 240
+        'grid_resolution': grid_ticks if best_match else 240,
+        'straight_16_unique_score': straight_16_score,
     }
 
 
@@ -3410,7 +3411,20 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
             grid_analysis = detect_note_grid_pattern(sublayer_events, ticks_per_beat=3840)
             is_unquantised = grid_analysis['is_unquantised']
             detected_step_len = grid_analysis['step_len']
-            
+            s16_unique = grid_analysis.get('straight_16_unique_score', 0.0)
+            # Keys: humanised near-16th grooves should not stay on quantised triplet grids.
+            if (
+                seq_mode == 'Keys'
+                and detected_step_len in (9, 11)
+                and 0.55 <= s16_unique < 0.95
+            ):
+                is_unquantised = True
+                detected_step_len = 10
+                logger.info(
+                    f'  Keys: {s16_unique * 100:.0f}% unique onsets on 16th grid → '
+                    f'unquantised 16th (not triplet step_len)'
+                )
+
             # DEBUG: Log detection result for all tracks to diagnose quantisation detection
             if sublayer_idx == 0:  # Only for first sublayer
                 logger.info(f'    Track {track_idx}, Sub-layer {chr(65+sublayer_idx)}: Detection result - is_unquantised={is_unquantised}, detected_step_len={detected_step_len}, seq_mode={seq_mode}')
