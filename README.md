@@ -115,12 +115,18 @@ The original script used a clip-based approach for Ableton Live 10/11. This vers
 - **Ableton Live 10/11/12** project files (`.als` format)
 - **1010music Blackbox** firmware 2.3+ (for sequence format compatibility)
 
-All dependencies are standard Python libraries (no external packages required):
-- `xml.etree.ElementTree`
-- `argparse`
-- `gzip`
-- `os`, `shutil`
-- `struct` (for WAV file reading)
+Most of the converter uses only standard library modules (`xml.etree.ElementTree`, `argparse`,
+`gzip`, `struct`, `wave`, …).
+
+Optional (recommended for richer WAV formats):
+
+- **`soundfile` + `numpy`**: Used when **`--utility-master-gain`** bakes Ableton master Utility gain
+  into exported samples; preserves the source WAV subtype (16/24‑bit PCM, float, etc.).
+- **`ffmpeg`** on `$PATH`: fallback for Utility gain bake when neither `soundfile` nor native
+  16‑bit PCM multiply applies.
+
+Smoke tests including Utility parsing and PCM16 multiply:\
+`python3 -m unittest tests/test_master_utility_gain`
 
 ## Quick Start
 
@@ -136,6 +142,16 @@ python3 code/xml_read.py -i "path/to/your/project.als" -o "output/preset_name"
 - `-o, --output`: Output directory name (will create folder with preset.xml and samples)
 - `-v, --verbose`: Enable verbose logging (useful for debugging)
 - `-h, --help`: Show help message
+- **`--utility-master-gain`** (experimental): Reads **Gain** from the **first enabled Utility**
+  device on the Ableton master chain (native tag `StereoGain` in the `.als` file — this is Ableton Utility).
+  The stored value is a **linear** amplitude; the exporter multiplies **every Drum Rack WAV** by it and
+  leaves **Blackbox preset `gaindb` unchanged** so levels are not double-applied. Only the **first**
+  Utility encountered on the chain is used; if Utility is bypassed (`On` → off), scanning continues.
+
+  **Dependencies / clipping**: Prefer `pip install numpy soundfile` for full-format support. Pure
+  **`wave`/`array`** handles **mono/stereo 16‑bit PCM** only; **`ffmpeg`** is used otherwise if installed.
+  A **warning is logged** when normalized peaks exceed ±1 before writing (floating-point WAV) or samples
+  would clip integer PCM. Loud mixes can distort after a boost — check levels in Ableton before converting.
 
 ### Example
 

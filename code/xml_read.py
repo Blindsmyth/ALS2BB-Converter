@@ -48,8 +48,8 @@ logger = logging.getLogger(__name__)
 # #region agent log
 import json as _json_dbg
 import time as _time_dbg
-_DEBUG_LOG_PATH = '/Users/simon/Dropbox/Blackbox Stuff/ableton_blackbox/.cursor/debug-d8533d.log'
-_DEBUG_SESSION_ID = 'd8533d'
+_DEBUG_LOG_PATH = '/Users/simon/Dropbox/Blackbox Stuff/ableton_blackbox/.cursor/debug-870236.log'
+_DEBUG_SESSION_ID = '870236'
 
 def _dbg(location, message, data=None, hypothesis=None):
     try:
@@ -149,6 +149,28 @@ def limit_slice_positions_density_priority(positions, max_count, samlen_int=None
     return out
 
 
+def _dedupe_keys_quantised_same_step_strtks(events):
+    """
+    Collapse stacked MIDI notes that quantise to the same step/strtks (Keys mode).
+
+    Live sometimes writes two hits on one triplet grid slot; hand-trimmed BB presets keep a
+    single row (lowest MIDI pitch wins). Matches Digital Waterfall fixed preset shape.
+    """
+    if len(events) < 2:
+        return events
+    best = {}
+    for e in events:
+        key = (int(e.get('step', 0)), int(e.get('strtks', 0)))
+        cur = best.get(key)
+        if cur is None or int(e.get('pitch', 127)) < int(cur.get('pitch', 127)):
+            best[key] = e
+    return sorted(best.values(), key=lambda x: (
+        int(x.get('strtks', 0)),
+        int(x.get('pitch', 0)),
+        int(str(x.get('chan', 0))),
+    ))
+
+
 def get_wav_info(filepath):
     """
     Read WAV file header and return sample information.
@@ -224,6 +246,199 @@ def get_wav_info(filepath):
     except Exception as e:
         logger.debug(f"Error reading WAV file {filepath}: {e}")
         return None
+
+
+def _sf_normalized_peak_clips(np, block):
+    """True if magnitude exceeds 1.0 (normalized float PCM as returned by ``soundfile``)."""
+    if block is None or block.size == 0:
+        return False
+    return float(np.max(np.abs(block))) > 1.0 + 1e-6
+
+
+def _gain_wav_via_soundfile_numpy(src, dst, linear_gain):
+    try:
+        import numpy as np
+        import soundfile as sf  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        return False
+
+    info = sf.info(src)
+    data, samplerate = sf.read(src, always_2d=True, dtype='float64')
+
+    subtype = getattr(info, 'subtype', None)
+    clipped = False
+    if linear_gain != 1.0 and data.size:
+        pre_peak = float(np.max(np.abs(data))) * linear_gain
+        clipped = clipped or pre_peak > 1.0 + 1e-6
+
+    scaled = np.multiply(data, linear_gain, out=data, casting='unsafe')
+    if linear_gain != 1.0 and scaled.size:
+        clipped = clipped or _sf_normalized_peak_clips(np, scaled)
+
+    sf.write(dst, scaled, samplerate, subtype=subtype, format=getattr(info, 'format', 'WAV'))
+
+    if clipped:
+        logger.warning(f'Potential clipping after Utility gain bake: {os.path.basename(dst)}')
+    return True
+
+
+def _gain_wav_via_wave_pcm16(src, dst, linear_gain):
+    """
+    Multiply 16‑bit PCM WAV channels by ``linear_gain`` (pure Python fallback when NumPy absent).
+    """
+    try:
+        import wave  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        return False
+
+    wav_info = get_wav_info(src)
+    if not wav_info or int(wav_info.get('bits_per_sample', 0)) != 16:
+        return False
+
+    with wave.open(src, 'rb') as wf:
+        n_ch = wf.getnchannels()
+        sw = wf.getsampwidth()
+        sr = wf.getframerate()
+
+    if sw != 2:
+        return False
+
+    with open(src, 'rb') as f:
+        riff = f.read(4)
+        if riff != b'RIFF':
+            return False
+        f.read(4)
+        wave_id = f.read(4)
+        if wave_id != b'WAVE':
+            return False
+
+        data_offset = None
+        data_sz = None
+        while True:
+            cid = f.read(4)
+            if not cid or len(cid) < 4:
+                break
+            sz_bytes = f.read(4)
+            if len(sz_bytes) < 4:
+                break
+            chunk_size = struct.unpack('<I', sz_bytes)[0]
+            if cid == b'data':
+                data_offset = f.tell()
+                data_sz = chunk_size
+                break
+            f.seek(chunk_size, 1)
+            if chunk_size % 2:
+                f.seek(1, 1)
+
+    if data_offset is None:
+        return False
+
+    with open(src, 'rb') as f:
+        f.seek(data_offset)
+        pcm = f.read(data_sz)
+
+    clipped = False
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+
+    if np is not None:
+        arr = np.frombuffer(pcm, dtype=np.int16)
+        if n_ch > 1:
+            try:
+                arr = arr.reshape(-1, n_ch)
+            except ValueError:
+                return False
+        prod = np.multiply(arr.astype(np.float64, copy=False), linear_gain)
+        if np.any(np.abs(prod) > 32767.0 + 1e-9):
+            clipped = True
+        pcm_out = np.clip(np.rint(prod), -32768, 32767).astype(np.int16).tobytes()
+    else:
+        import array as _array
+        samp = _array.array('h')
+        samp.frombytes(pcm)
+        if n_ch <= 0 or len(samp) % n_ch != 0:
+            return False
+
+        scaled = _array.array('h')
+        for iv in samp:
+            fv = float(iv) * linear_gain
+            r = int(math.floor(fv + 0.5)) if fv >= 0 else int(math.ceil(fv - 0.5))
+            if r > 32767 or r < -32768:
+                clipped = True
+            if r > 32767:
+                r = 32767
+            elif r < -32768:
+                r = -32768
+            scaled.append(r)
+        pcm_out = scaled.tobytes()
+
+    with wave.open(dst, 'wb') as out_w:
+        out_w.setnchannels(n_ch)
+        out_w.setsampwidth(sw)
+        out_w.setframerate(sr)
+        out_w.writeframes(pcm_out)
+
+    if clipped:
+        logger.warning(f'PCM16 clipping after Utility gain bake: {os.path.basename(dst)}')
+    return True
+
+
+def _gain_wav_via_ffmpeg(src, dst, linear_gain):
+    exe = shutil.which('ffmpeg')
+    if not exe:
+        return False
+    if linear_gain <= 0:
+        return False
+    gain_db = 20.0 * math.log10(max(linear_gain, 1e-20))
+    cmd = [
+        exe, '-nostdin', '-hide_banner', '-loglevel', 'warning', '-y',
+        '-i', src, '-af', f'volume={gain_db}dB', dst,
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except (subprocess.CalledProcessError, OSError):
+        return False
+
+    if linear_gain > 1.0 + 1e-6:
+        logger.warning(
+            'Utility gain bake used ffmpeg boost — check exported WAVs for clipping: '
+            f'{os.path.basename(dst)}'
+        )
+    return True
+
+
+def copy_wav_with_master_gain(src_path: str, dest_path: str, linear_gain: float):
+    """
+    Write ``dest_path`` with every sample multiplied by ``linear_gain``.
+
+    Prefer ``soundfile`` + NumPy when installed (preserves WAV subtype/format),
+    falling back to 16‑bit PCM via ``wave`` + NumPy, then ``ffmpeg`` volume in dB.
+    Raises ``RuntimeError`` if conversion is not supported on this machine.
+    """
+    if linear_gain <= 0 or not math.isfinite(linear_gain):
+        raise ValueError('linear_gain must be a finite positive number')
+
+    if abs(linear_gain - 1.0) <= 1e-15:
+        shutil.copy2(src_path, dest_path)
+        return
+
+    if _gain_wav_via_soundfile_numpy(src_path, dest_path, linear_gain):
+        return
+
+    logger.info('soundfile+numpy unavailable or unsuitable — trying PCM16 WAV fallback...')
+    if _gain_wav_via_wave_pcm16(src_path, dest_path, linear_gain):
+        return
+
+    logger.info('PCM16 wave fallback not applicable — trying ffmpeg...')
+    if _gain_wav_via_ffmpeg(src_path, dest_path, linear_gain):
+        return
+
+    raise RuntimeError(
+        'Utility gain bake needs soundfile+NumPy for this WAV '
+        '(or 16‑bit PCM in the WAV + stdlib/array, or ffmpeg on PATH)'
+    )
 
 
 def read_project(file):
@@ -434,6 +649,148 @@ def find_tempo(root):
     except Exception as e:
         logger.warning(f"Error finding tempo: {e}. Using default 120 BPM")
         return '120'
+
+
+def _xml_local_tag(elem):
+    """Strip XML namespace prefix from Element.tag, if present."""
+    tag = getattr(elem, 'tag', '')
+    if not isinstance(tag, str):
+        return ''
+    if tag and tag[0] == '{':
+        return tag.partition('}')[-1]
+    return tag
+
+
+def _nested_devices_under_master_track(master_track):
+    """Return the <Devices> element under Master/Main track device chain (Live 11/12-style nesting)."""
+    device_chain = find_element_by_tag(master_track, 'DeviceChain')
+    if device_chain is None:
+        return None
+    nested_chain = find_element_by_tag(device_chain, 'DeviceChain')
+    if nested_chain is None:
+        return None
+    return find_element_by_tag(nested_chain, 'Devices')
+
+
+def _utility_device_engaged(device):
+    """
+    Return False if Ableton Utility (StereoGain) is bypass/off.
+    Missing <On> defaults to engaged.
+    """
+    on_el = None
+    for ch in device:
+        if _xml_local_tag(ch) == 'On':
+            on_el = ch
+            break
+    if on_el is None:
+        return True
+    manual = find_element_by_tag(on_el, 'Manual')
+    if manual is None or 'Value' not in manual.attrib:
+        return True
+    raw = manual.attrib['Value'].strip().lower()
+    if raw in ('false', '0', 'no', 'off'):
+        return False
+    return True
+
+
+def _effective_name_under_name_block(device_elem):
+    """Return EffectiveName/@Value inside a <Name>...</Name> subtree, if present."""
+    for el in device_elem.iter():
+        if _xml_local_tag(el) != 'Name':
+            continue
+        for ch in el:
+            if _xml_local_tag(ch) != 'EffectiveName':
+                continue
+            v = ch.attrib.get('Value')
+            if v is not None and str(v).strip():
+                return str(v).strip()
+    return None
+
+
+def extract_master_utility_gain_db(root, log_on_match=True):
+    """
+    Read the Gain value from the first engaged Ableton Utility on the master/output chain.
+
+    Live persists Utility as the native device tag ``StereoGain`` with ``Gain/Manual@Value``.
+    That value is a **linear amplitude** multiplier (unity = ``1.0``, +3 dB ≈ ``1.4125``).
+
+    Converts to **dB**: ``20 * log10(linear)``.
+
+    ``log_on_match``: when False, suppress INFO for a successful read (caller may log separately).
+
+    Returns ``None`` if no Utility/StereoGain is found, Gain is unreadable, the device is
+    bypassed, or linear gain is non-positive.
+
+    Scope: MainTrack (Live 12+) or MasterTrack fallback only.
+    Only the **first** matching Utility along the master's device chain is used.
+    """
+    try:
+        liveset = root[0]
+    except (IndexError, TypeError):
+        return None
+
+    main_track = find_element_by_tag(liveset, 'MainTrack')
+    if main_track is None:
+        main_track = find_element_by_tag(liveset, 'MasterTrack')
+    if main_track is None:
+        logger.debug('extract_master_utility_gain_db: no MainTrack/MasterTrack')
+        return None
+
+    devices_elem = _nested_devices_under_master_track(main_track)
+    if devices_elem is None:
+        logger.debug('extract_master_utility_gain_db: nested Devices missing on master chain')
+        return None
+
+    for device in devices_elem:
+        is_utility_like = False
+        if _xml_local_tag(device) == 'StereoGain':
+            is_utility_like = True
+        else:
+            en = _effective_name_under_name_block(device)
+            if en is not None and en.strip().lower() == 'utility':
+                is_utility_like = True
+        if not is_utility_like:
+            continue
+        if not _utility_device_engaged(device):
+            if log_on_match:
+                logger.info('Master Utility (StereoGain) is bypassed; not applying Utility gain.')
+            else:
+                logger.debug('Master Utility (StereoGain) is bypassed; skipping device.')
+            continue
+
+        gain_node = None
+        for ch in device:
+            if _xml_local_tag(ch) == 'Gain':
+                gain_node = ch
+                break
+        if gain_node is None:
+            logger.warning('extract_master_utility_gain_db: Utility lacks Gain subtree')
+            return None
+
+        manual = find_element_by_tag(gain_node, 'Manual')
+        if manual is None or 'Value' not in manual.attrib:
+            logger.warning('extract_master_utility_gain_db: Utility Gain has no Manual@Value')
+            return None
+
+        try:
+            linear = float(str(manual.attrib['Value']).strip())
+        except (ValueError, TypeError):
+            logger.warning('extract_master_utility_gain_db: could not parse linear gain')
+            return None
+
+        if linear <= 0.0:
+            logger.warning('extract_master_utility_gain_db: non-positive linear gain — skipping Utility bake')
+            return None
+
+        if not math.isfinite(linear):
+            return None
+
+        db = 20.0 * math.log10(linear)
+        if log_on_match:
+            logger.info(f'Master Utility gain: {db:.6f} dB (linear {linear:.8f})')
+        return db
+
+    return None
 
 
 def find_tracks(root):
@@ -2167,6 +2524,22 @@ def detect_note_grid_pattern(events, ticks_per_beat=3840):
             best_match = best_triplet_match
             best_score = best_triplet_score
             logger.debug(f'  Grid analysis: Triplets detected ({best_triplet_score*100:.0f}% aligned), using triplet step_len')
+        elif (
+            best_triplet_score == best_straight_score
+            and best_straight_match is not None
+            and best_triplet_match is not None
+            and best_straight_match[1] in (6, 8)
+            and best_triplet_match[1] in (9, 11)
+        ):
+            # Tie: coarse straight (1/4, 1/8) vs triplet (1/8T, 1/16T). Beat-only patterns score
+            # 100% on both; prefer triplet so export uses 8T/16T (notesteplen 9 + stride 960) like Seq2,
+            # otherwise step_len 6 sounds one hit per quarter on hardware.
+            best_match = best_triplet_match
+            best_score = best_triplet_score
+            logger.debug(
+                '  Grid analysis: Straight vs triplet tie on coarse grid → prefer triplet step_len '
+                f'({best_triplet_match[2]} over {best_straight_match[2]})'
+            )
         elif best_triplet_score == best_straight_score and best_is_triplet:
             # Scores equal but current best_match is triplet - prefer straight (default)
             if best_straight_match:
@@ -2330,6 +2703,22 @@ def _max_note_span_in_clip(midi_clip):
 _MAX_CLIP_LENGTH_BEATS = 4096.0
 
 
+def _step_count_from_clip_and_grid(clip_length_beats, steps_per_beat):
+    """
+    Convert clip length (beats) to step count for the active step grid.
+
+    Use ceil(beats * steps_per_beat): raw int() truncation can drop one step when Live
+    exports clip end slightly below N.0 beats (e.g. 15.999… → int*3 = 47 → wrong length),
+    or make triplet lengths (16×3 = 48) look inconsistent next to note-based expansion.
+    """
+    if clip_length_beats <= 0:
+        return 1
+    spb = float(steps_per_beat)
+    raw = float(clip_length_beats) * spb
+    n = int(math.ceil(raw - 1e-12))
+    return min(256, max(1, n))
+
+
 def _clip_length_beats_from_midi_clip(midi_clip, extracted_note_count=0, als_major_version=None):
     """
     Convert ALS clip loop / arrangement bounds to sequence length in beats.
@@ -2389,6 +2778,37 @@ def _clip_length_beats_from_midi_clip(midi_clip, extracted_note_count=0, als_maj
 
     # --- Loop on: loop brace defines repeating region ---
     if loop_on and loop_span > 0:
+        # Live 11+ (MajorVersion >= 5): loop_span, arrangement slot, and note span all match in
+        # beat-native units — e.g. Digital Waterfall Seq13 arrangement clip A: Loop 0–32 beats,
+        # CurrentStart/End span 32 beats, notes fill the loop. Legacy branch below would treat
+        # loop_span 32 as raw "large integer" and return 32/16 = 2 beats (wrong).
+        if (
+            als_major_version is not None
+            and als_major_version >= 5
+            and play_range > 0
+            and abs(loop_span - play_range) <= eps * max(loop_span, play_range, 32.0)
+            and abs(note_max - loop_span) <= eps * max(note_max, loop_span, 32.0)
+        ):
+            beats = play_range
+            logger.debug(
+                f'Clip length: beat-native loop matches timeline loop_span={loop_span} '
+                f'play_range={play_range} note_max={note_max} -> {beats} beats'
+            )
+            # #region agent log
+            _dbg(
+                'xml_read.py:_clip_length_beats',
+                'beat-native loop triple match (loop/timeline/notes)',
+                {
+                    'loop_span': loop_span,
+                    'play_range': play_range,
+                    'note_max': note_max,
+                    'beats_out': beats,
+                    'als_major_version': als_major_version,
+                },
+                hypothesis='H_clip_triple',
+            )
+            # #endregion
+            return max(1.0, min(beats, _MAX_CLIP_LENGTH_BEATS))
         # Large integer loop matching note span (legacy)
         if loop_span >= 32 and note_max >= 32 and abs(loop_span - note_max) <= eps * max(loop_span, 32.0):
             # Live uses different scalings: 128→4 beats (/32) vs 64→4 beats (/16) for same bar count.
@@ -2543,7 +2963,7 @@ def _midi_clip_has_notes(midi_clip):
     return False
 
 
-def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=None, unquantised=False, expected_seq_params=None,
+def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=None, unquantised=False,
                             als_major_version=None):
     """
     Create Blackbox sequences from MIDI tracks using firmware 2.3+ format.
@@ -3000,11 +3420,11 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                         9: 1.5,  # 1/8T (will round)
                     }
                     steps_per_beat = steps_per_beat_map_temp.get(step_len, 4)
-                    step_count = int(clip_length_beats * steps_per_beat)
+                    step_count = _step_count_from_clip_and_grid(clip_length_beats, steps_per_beat)
                 else:
                     # Unquantised or no detection: use default 1/16
                     step_len = 10
-                    step_count = int(clip_length_beats * 4)
+                    step_count = _step_count_from_clip_and_grid(clip_length_beats, 4)
                 
                 # If step_count exceeds 256: when grid is 1/16 and clip is short (<=64 beats), cap at 256
                 # (fixes misread clip_length e.g. from CurrentEnd). For long clips (>64 beats), coarsen to 1/8 etc.
@@ -3015,37 +3435,37 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                 # Otherwise use coarser resolution until step_count <= 256
                 if step_count > 256:
                     # Try 1/8 notes: 1 beat = 2 steps, 1 bar = 8 steps
-                    step_count = int(clip_length_beats * 2)
+                    step_count = _step_count_from_clip_and_grid(clip_length_beats, 2)
                     step_len = 8
                     
                 if step_count > 256:
                     # Try 1/4 notes: 1 beat = 1 step, 1 bar = 4 steps
-                    step_count = int(clip_length_beats * 1)
+                    step_count = _step_count_from_clip_and_grid(clip_length_beats, 1)
                     step_len = 6
                     
                 if step_count > 256:
                     # Try 1/2 notes: 2 beats = 1 step, 1 bar = 2 steps
-                    step_count = int(clip_length_beats * 0.5)
+                    step_count = _step_count_from_clip_and_grid(clip_length_beats, 0.5)
                     step_len = 4
                     
                 if step_count > 256:
                     # Try 1 Bar: 4 beats = 1 step
-                    step_count = int(clip_length_beats * 0.25)
+                    step_count = _step_count_from_clip_and_grid(clip_length_beats, 0.25)
                     step_len = 3
                     
                 if step_count > 256:
                     # Try 2 Bars: 8 beats = 1 step
-                    step_count = int(clip_length_beats * 0.125)
+                    step_count = _step_count_from_clip_and_grid(clip_length_beats, 0.125)
                     step_len = 2
                     
                 if step_count > 256:
                     # Try 4 Bars: 16 beats = 1 step
-                    step_count = int(clip_length_beats * 0.0625)
+                    step_count = _step_count_from_clip_and_grid(clip_length_beats, 0.0625)
                     step_len = 1
                     
                 if step_count > 256:
                     # Max: 8 Bars: 32 beats = 1 step
-                    step_count = max(1, int(clip_length_beats * 0.03125))
+                    step_count = max(1, min(256, _step_count_from_clip_and_grid(clip_length_beats, 0.03125)))
                     step_len = 0
                 
                 # Ensure step_count is at least 1
@@ -3053,16 +3473,6 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                     step_count = 1
                 
                 logger.debug(f'    Sub-layer {chr(65+sublayer_idx)}: {clip_length_beats} beats → step_count={step_count}, step_len={step_len} (unquantised={is_unquantised})')
-            
-            # Override with expected preset sequence lengths when -c compare is provided
-            if expected_seq_params and sequence_location_pad in expected_seq_params:
-                sublayer_params = expected_seq_params[sequence_location_pad]
-                if sublayer_idx in sublayer_params:
-                    step_count, step_len = sublayer_params[sublayer_idx]
-                    logger.info(f'    Sub-layer {chr(65+sublayer_idx)}: Using expected preset notestepcount={step_count}, notesteplen={step_len} (seq {sequence_location_pad+1})')
-                elif 0 in sublayer_params:
-                    step_count, step_len = sublayer_params[0]
-                    logger.info(f'    Sub-layer {chr(65+sublayer_idx)}: Using expected preset sublayer 0: notestepcount={step_count}, notesteplen={step_len} (seq {sequence_location_pad+1})')
             
             # Recalculate step values based on detected step_len
             # This must happen AFTER step_len is determined
@@ -3076,15 +3486,73 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
             }
             steps_per_beat = steps_per_beat_map.get(step_len, 4)
 
-            # Quantised 1/16 triplets (internal step_len 11): write notesteplen=9 ("8 triplet" UI).
-            # Step indices use round(beats * 3). strtks MUST use triplet tick spacing: 3840/3 = 1280
-            # ticks per triplet slot — NOT 960 (960 = ¼ beat = straight 16th spacing on the clock,
-            # which makes the groove sound 16th-locked on hardware despite the triplet grid).
+            # Quantised triplets: Blackbox "8T" UI is notesteplen=9 with strtks = step_index * 960.
+            # Reference: Digital Waterfall fixed preset (seq2). 1280 (=3840/3) breaks on-device grid.
+            # Step indices snap on the *detected* note grid (16T→3/beat); step_count may use 8T (48 steps).
             notesteplen_written = step_len
-            triplet_quant_strtks_stride = None  # None → use 3840/steps_per_beat triplet lattice ticks
-            if not is_unquantised and step_len == 11:
+            triplet_quant_strtks_stride = None
+            triplet_snap_steps_per_beat = None
+            if not is_unquantised and step_len in (11, 9):
                 notesteplen_written = 9
-                triplet_quant_strtks_stride = 1280
+                triplet_quant_strtks_stride = 960
+                grid_for_snap = detected_step_len if detected_step_len in (11, 9) else step_len
+                triplet_snap_steps_per_beat = steps_per_beat_map.get(grid_for_snap, steps_per_beat)
+
+            step_count_pre_expand = step_count
+
+            # Quantised: ensure notestepcount spans every step index used by note times. Clip-length-only
+            # step_count can truncate (especially int(beats * 1.5)); that clamps notes to step_count-1
+            # and stacks them — wrong on hardware.
+            if not is_unquantised and sublayer_events:
+                if notesteplen_written == 9 or step_len in (11, 9):
+                    spb_pre = float(triplet_snap_steps_per_beat if triplet_snap_steps_per_beat else steps_per_beat)
+                else:
+                    spb_pre = float(steps_per_beat)
+                max_step_ix = 0
+                for _ev in sublayer_events:
+                    max_step_ix = max(max_step_ix, int(round(float(_ev.get('time_val', 0)) * spb_pre)))
+                need_steps = max_step_ix + 1
+                if need_steps > step_count:
+                    if need_steps > 256:
+                        logger.warning(
+                            f'    Sub-layer {chr(65+sublayer_idx)}: Notes need step index up to {max_step_ix} '
+                            f'({need_steps} steps) but Blackbox max is 256; some steps may clamp.'
+                        )
+                    step_count = min(256, max(step_count, need_steps))
+                    logger.info(
+                        f'    Sub-layer {chr(65+sublayer_idx)}: step_count → {step_count} '
+                        f'to cover notes through step index {max_step_ix}'
+                    )
+            # #region agent log
+            if not is_unquantised and sublayer_events:
+                if notesteplen_written == 9 or step_len in (11, 9):
+                    spb_dbg = float(triplet_snap_steps_per_beat if triplet_snap_steps_per_beat else steps_per_beat)
+                else:
+                    spb_dbg = float(steps_per_beat)
+                max_ix_dbg = 0
+                for _ev in sublayer_events:
+                    max_ix_dbg = max(max_ix_dbg, int(round(float(_ev.get('time_val', 0)) * spb_dbg)))
+                _dbg(
+                    'xml_read.py:step_count_expand',
+                    'H_trunc/MIDI step grid: pre count vs max note step index',
+                    data={
+                        'track_idx': track_idx,
+                        'sublayer': chr(65 + sublayer_idx),
+                        'seq_mode': seq_mode,
+                        'step_count_pre_expand': step_count_pre_expand,
+                        'notestepcount_after': step_count,
+                        'max_step_ix': max_ix_dbg,
+                        'need_steps': max_ix_dbg + 1,
+                        'notesteplen_written': notesteplen_written,
+                        'triplet_snap_steps_per_beat': triplet_snap_steps_per_beat,
+                        'spb_used_for_max_ix': spb_dbg,
+                        'clip_length_beats': float(clip_length_beats),
+                        'event_count': len(sublayer_events),
+                        'runId': 'verify-seq5',
+                    },
+                    hypothesis='H_trunc',
+                )
+            # #endregion
             
             # CRITICAL: Tick rate depends ONLY on quantisation state, NOT on sequence mode
             # Quantised sequences (both Keys and Pads): Use 3840 ticks/beat
@@ -3128,10 +3596,9 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                 for event in sublayer_events:
                     time_val = event.get('time_val', 0)
                     dur_val = event.get('dur_val', 0)
-                    if step_len in (11, 9):
-                        # Lock step index to triplet grid; strtks uses true triplet ticks on the
-                        # 3840/beat clock (1280 per 1/16-triplet slot when exporting steplen 9).
-                        spb = float(steps_per_beat)
+                    if notesteplen_written == 9 or step_len in (11, 9):
+                        # Lock step index to detected triplet grid; strtks uses 960/step for notesteplen 9.
+                        spb = float(triplet_snap_steps_per_beat if triplet_snap_steps_per_beat else steps_per_beat)
                         stride = float(triplet_quant_strtks_stride) if triplet_quant_strtks_stride else (
                             3840.0 / spb
                         )
@@ -3158,6 +3625,8 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                     int(e.get('pitch', 0)),
                     int(str(e.get('chan', 0))),
                 ))
+                if seq_mode == 'Keys':
+                    sublayer_events = _dedupe_keys_quantised_same_step_strtks(sublayer_events)
                 # #region agent log
                 if sublayer_events:
                     _dbg('xml_read.py:2837', 'H1/H7 lencount=1 + chronological sort', data={
@@ -3218,9 +3687,17 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                     seqpadmapdest_val = str(target_pad)  # Target pad to play
                     midioutchan_val = '0'
             elif seq_mode == 'MIDI':
-                seqstepmode_val = '0'  # MIDI mode
+                # Quantised MIDI: step mode on (matches Keys/Pads triplet clock). Unquantised: off.
+                if is_unquantised:
+                    seqstepmode_val = '0'
+                else:
+                    seqstepmode_val = '1'
                 seqpadmapdest_val = '0'
-                midioutchan_val = str(mode_target)  # MIDI channel (0-15)
+                # Blackbox MIDIOUT is Ch1–Ch16 (docs/BLACKBOX_TECHNICAL_REFERENCE.md). Ableton External
+                # routing Target ends in the MIDI *wire* index 0–15 (e.g. .../11 = Ch12). Seq note
+                # events keep wire chan; only this cell param uses human 1–16.
+                mt = 0 if mode_target is None else int(mode_target)
+                midioutchan_val = str(max(1, min(16, mt + 1)))
             
             if sublayer_idx == 0:
                 if seq_mode == 'Pads' and len(sublayer_events) >= 3:
@@ -3251,8 +3728,13 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                 'seq_loc_pad': sequence_location_pad,
                 'seq_mode': seq_mode,
                 'clip_length_beats': float(clip_length_beats),
-                'step_len_written': step_len,
+                'detected_step_len': detected_step_len,
+                'step_len_internal': step_len,
+                'notesteplen_written': notesteplen_written,
+                'triplet_strtks_stride': triplet_quant_strtks_stride,
+                'triplet_snap_steps_per_beat': triplet_snap_steps_per_beat,
                 'notestepcount_written': step_count,
+                'seqstepmode_written': seqstepmode_val,
                 'dispmode_written': dispmode_val,
                 'activeseqlayer_written': track_activeseqlayer_head if sublayer_idx == 0 else 0,
                 'arrangement_max_layer_idx': arrangement_max_layer_idx,
@@ -3271,19 +3753,20 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                 logger.info(f'  Track {track_idx}, Sub-layer {sublayer_idx}: Writing {len(sublayer_events)} events to cell at row={sequence_row}, col={sequence_column}, seqpadmapdest={seqpadmapdest_val}, first_strtks={first_strtks}')
             for event_data in sublayer_events:
                 seqevent = ET.SubElement(sequence, 'seqevent')
+                # Attribute order matches hand-edited BB / golden presets (step … pitch … lencount).
                 seqevent.attrib = {
                     'step': str(event_data['step']),
                     'chan': str(event_data['chan']),
                     'type': event_data['type'],
                     'strtks': str(event_data['strtks']),
+                    'pitch': str(event_data['pitch']),
                     'lencount': str(event_data['lencount']),
-                    'lentks': str(event_data['lentks'])
+                    'lentks': str(event_data['lentks']),
                 }
-                # In pads mode (seqstepmode=1), pitch should be the pad number (0-15)
-                # This tells Blackbox which pad to trigger: pitch=0 → pad 0, pitch=1 → pad 1, etc.
-                seqevent.attrib['pitch'] = str(event_data['pitch'])
-                if event_data['velocity'] != 100:
-                    seqevent.attrib['velocity'] = str(event_data['velocity'])
+                vel = int(event_data.get('velocity', 100))
+                # Omit velocity when Live/default full strike — golden presets omit attribute.
+                if vel not in (100, 127):
+                    seqevent.attrib['velocity'] = str(vel)
             
             if sublayer_events:
                 # Debug: Log first note's strtks to verify we have the right notes
@@ -4523,185 +5006,6 @@ def save_xml(root, preset_filepath):
     logger.info(f"Saved preset to: {preset_filepath}")
 
 
-def _section_content_from_root(root):
-    """Extract list of section dicts: name, repeats, pad_conds {(pad_idx, silayer): cond}, seq_conds {(seq_idx, silayer): cond}."""
-    session = root.find('session')
-    if session is None:
-        return []
-    out = []
-    for cell in session.findall('cell'):
-        if cell.get('layer') != '2' or cell.get('type') != 'section':
-            continue
-        name = cell.get('name', '')
-        params = cell.find('params')
-        repeats = int(params.get('sectionrepeats', 1)) if params is not None else 1
-        seq_el = cell.find('sequence')
-        pad_conds = {}
-        seq_conds = {}
-        if seq_el is not None:
-            for ev in seq_el.findall('seqevent'):
-                if ev.get('type') != 'sceneitem':
-                    continue
-                chan = ev.get('chan')
-                silayer = int(ev.get('silayer', '0') or 0)
-                cond = int(ev.get('cond', 0))
-                c = 0 if chan is None else None
-                if c is None:
-                    try:
-                        c = int(chan)
-                    except (ValueError, TypeError):
-                        continue
-                if 0 <= c <= 15:
-                    pad_conds[(c, silayer)] = cond
-                elif 256 <= c <= 271:
-                    seq_conds[(c - 256, silayer)] = cond
-        out.append({'name': name, 'repeats': repeats, 'pad_conds': pad_conds, 'seq_conds': seq_conds})
-    return out
-
-
-def _load_expected_sequence_params(expected_path):
-    """
-    Load notestepcount and notesteplen from expected preset XML.
-    Returns dict: expected_seq_params[seqpadmapdest][sublayer_idx] = (step_count, step_len).
-    When -c compare is provided, use these to override calculated sequence lengths
-    (fixes clip length misdetection for arrangement clips that span full song).
-    """
-    try:
-        with open(expected_path, 'r') as f:
-            exp_root = ET.fromstring(f.read().rstrip('\x00'))
-    except Exception as e:
-        logger.warning(f"Cannot load expected preset for sequence params: {e}")
-        return {}
-    out = {}
-    for cell in exp_root.iter('cell'):
-        if cell.get('type') != 'noteseq':
-            continue
-        params = find_element_by_tag(cell, 'params')
-        if params is None:
-            continue
-        seqpad = params.attrib.get('seqpadmapdest')
-        if seqpad is None:
-            continue
-        try:
-            seqpad_idx = int(seqpad)
-        except (ValueError, TypeError):
-            continue
-        sublayer = cell.get('seqsublayer', '0')
-        try:
-            sublayer_idx = int(sublayer)
-        except (ValueError, TypeError):
-            sublayer_idx = 0
-        stepcount = params.attrib.get('notestepcount')
-        steplen = params.attrib.get('notesteplen')
-        if stepcount is None or steplen is None:
-            continue
-        try:
-            sc = int(stepcount)
-            sl = int(steplen)
-        except (ValueError, TypeError):
-            continue
-        if seqpad_idx not in out:
-            out[seqpad_idx] = {}
-        out[seqpad_idx][sublayer_idx] = (sc, sl)
-    return out
-
-def _sections_from_expected_preset(expected_path, num_pads=16, num_seqs=16):
-    """
-    Load song section content from an expected preset XML.
-    Returns list of section dicts in our format: pad_conds {pad_idx: cond},
-    seq_conds {(seq_idx, layer): cond}.
-    Pad cond uses max of silayer 0 and 1 (layer B pads). Seq conds include layer 1 for pad-carried B.
-    """
-    try:
-        with open(expected_path, 'r') as f:
-            exp_root = ET.fromstring(f.read().rstrip('\x00'))
-    except Exception as e:
-        logger.warning(f"Cannot load expected preset for song override: {e}")
-        return []
-    raw = _section_content_from_root(exp_root)
-    out = []
-    for sec in raw:
-        # Preserve (pad_idx, silayer) keys — make_song_from_sections expects this format.
-        pad_conds = {}
-        for pad_idx in range(num_pads):
-            for silayer in range(5):
-                c = sec['pad_conds'].get((pad_idx, silayer), 0)
-                if c >= 1:
-                    pad_conds[(pad_idx, silayer)] = c
-        seq_conds = {}
-        for seq_idx in range(num_seqs):
-            for li in range(4):
-                c = sec['seq_conds'].get((seq_idx, li), 0)
-                if c >= 1:
-                    seq_conds[(seq_idx, li)] = c
-        out.append({
-            'name': sec['name'],
-            'repeats': sec['repeats'],
-            'pad_conds': pad_conds,
-            'seq_conds': seq_conds,
-        })
-    return out
-
-
-def compare_section_content(expected_preset_path, actual_preset_path, max_sections=None):
-    """
-    Compare song section content (name, repeats, pad/seq conds) between expected and actual preset XML.
-    Logs differences and returns number of mismatches.
-    If max_sections is None, compare all sections present in both files (up to shared length).
-    """
-    try:
-        with open(expected_preset_path, 'r') as f:
-            exp_root = ET.fromstring(f.read().rstrip('\x00'))
-    except Exception as e:
-        logger.warning(f"Cannot load expected preset for comparison: {e}")
-        return -1
-    try:
-        with open(actual_preset_path, 'r') as f:
-            act_root = ET.fromstring(f.read())
-    except Exception as e:
-        logger.warning(f"Cannot load actual preset for comparison: {e}")
-        return -1
-
-    def _human_pad(k):
-        return f"Pad {k[0] + 1}" if k[0] < 15 else f"Pad {k[0] + 1}(s{k[1]})"
-
-    def _human_seq(k):
-        return f"Seq {k[0] + 1}" if k[0] < 15 else f"Seq {k[0] + 1}(s{k[1]})"
-
-    exp_sec = _section_content_from_root(exp_root)
-    act_sec = _section_content_from_root(act_root)
-    n = min(len(exp_sec), len(act_sec))
-    if max_sections is not None:
-        n = min(n, int(max_sections))
-    mismatches = 0
-    logger.info('=== Song section content comparison (expected vs actual, human indexing Pad 1–16, Seq 1–16) ===')
-    for i in range(n):
-        e = exp_sec[i]
-        a = act_sec[i]
-        name_ok = e['name'] == a['name']
-        rep_ok = e['repeats'] == a['repeats']
-        pad_on_exp = {k for k, c in e['pad_conds'].items() if c >= 1}
-        pad_on_act = {k for k, c in a['pad_conds'].items() if c >= 1}
-        seq_on_exp = {k for k, c in e['seq_conds'].items() if c >= 1}
-        seq_on_act = {k for k, c in a['seq_conds'].items() if c >= 1}
-        pad_ok = pad_on_exp == pad_on_act
-        seq_ok = seq_on_exp == seq_on_act
-        if not (name_ok and rep_ok and pad_ok and seq_ok):
-            mismatches += 1
-            pad_exp_str = sorted(_human_pad(k) for k in pad_on_exp)
-            pad_act_str = sorted(_human_pad(k) for k in pad_on_act)
-            seq_exp_str = sorted(_human_seq(k) for k in seq_on_exp)
-            seq_act_str = sorted(_human_seq(k) for k in seq_on_act)
-            logger.warning(
-                f"  Section {i} {e['name']!r}: repeats exp={e['repeats']} act={a['repeats']} {'OK' if rep_ok else 'MISMATCH'}; "
-                f"pads exp={pad_exp_str} act={pad_act_str} {'OK' if pad_ok else 'MISMATCH'}; "
-                f"seqs exp={seq_exp_str} act={seq_act_str} {'OK' if seq_ok else 'MISMATCH'}"
-            )
-    if mismatches == 0 and n > 0:
-        logger.info(f'  All {n} section(s) match expected (name, repeats, pad/seq ON).')
-    return mismatches
-
-
 def main(args):
     logger.info('=== Ableton to Blackbox Converter v0.3 (Drum Rack Edition) ===')
     logger.info('Reading Ableton project...')
@@ -4711,6 +5015,7 @@ def main(args):
         'output': args.Output,
         'song_mode': bool(getattr(args, 'song_mode', False)),
         'unquantised': bool(getattr(args, 'unquantised', False)),
+        'utility_master_gain': bool(getattr(args, 'utility_master_gain', False)),
     }, hypothesis='startup')
     # #endregion
     
@@ -4721,6 +5026,34 @@ def main(args):
             als_major_version = int(str(root.attrib.get('MajorVersion', '') or '0'))
         except (ValueError, TypeError):
             als_major_version = None
+
+        linear_master_gain = None
+        want_utility_bake = getattr(args, 'utility_master_gain', False)
+        master_utility_gain_db = extract_master_utility_gain_db(
+            root, log_on_match=want_utility_bake
+        )
+        if want_utility_bake:
+            if master_utility_gain_db is not None:
+                linear_master_gain = 10.0 ** (master_utility_gain_db / 20.0)
+            else:
+                logger.info(
+                    '--utility-master-gain enabled but no usable master Utility Gain '
+                    '(no Utility found, unreadable Gain, bypassed chain, etc.) '
+                    '- exporting drum samples unchanged (same as Freeze / source files)'
+                )
+        elif (
+            master_utility_gain_db is not None
+            and abs(master_utility_gain_db) > 1e-6
+        ):
+            logger.warning(
+                'Master chain Utility Gain is about %.2f dB on disk in this .als, but '
+                'exported drum-rack WAVs are still plain **copies** of your sample/Freeze '
+                'files — **not** run through Ableton\'s master channel. Levels match the '
+                'source file unless you convert with **--utility-master-gain**. '
+                '(Blackbox pad gain XML is untouched either way unless you tune it.)'
+                % master_utility_gain_db
+            )
+
         tracks, tempo = track_tempo_extractor(root)
         logger.info(f'The project tempo is: {tempo} bpm')
         
@@ -4747,10 +5080,9 @@ def main(args):
         session, assets = make_drum_rack_pads(session, pad_list, tempo, project_label=project_label)
         
         # Create sequences from MIDI tracks
-        expected_seq_params = _load_expected_sequence_params(args.compare) if getattr(args, 'compare', None) else None
         session = make_drum_rack_sequences(
             session, midi_tracks, pad_list, midi_track_info, unquantised=args.unquantised,
-            expected_seq_params=expected_seq_params, als_major_version=als_major_version,
+            als_major_version=als_major_version,
         )
         
         # Build song sections (optional song mode)
@@ -4760,18 +5092,6 @@ def main(args):
             song_sections = build_song_sections(root, tracks, pad_list, midi_tracks, midi_track_info=midi_track_info, tolerance_beats=0.1)
             if not song_sections:
                 logger.warning('Song mode requested but no valid locators found; falling back to default empty sections')
-            # When -c compare is provided, use expected preset's song layout as source of truth
-            if getattr(args, 'compare', None) and song_sections:
-                expected_sections = _sections_from_expected_preset(
-                    args.compare, num_pads=len(pad_list), num_seqs=16
-                )
-                if expected_sections:
-                    n = min(len(song_sections), len(expected_sections))
-                    for i in range(n):
-                        song_sections[i]['pad_conds'] = expected_sections[i]['pad_conds']
-                        song_sections[i]['seq_conds'] = expected_sections[i]['seq_conds']
-                        song_sections[i]['repeats'] = expected_sections[i]['repeats']
-                    logger.info(f'Using expected preset song layout for {n} sections (from -c)')
         
         # Add song, FX, and master sections
         if song_sections:
@@ -4805,18 +5125,19 @@ def main(args):
                     if asset_path and os.path.exists(asset_path):
                         dest_path = os.path.join(args.Output, dest_name)
                         try:
-                            shutil.copy2(asset_path, dest_path)
-                            logger.info(f'  Copied: {dest_name} (from {os.path.basename(asset_path)})')
+                            if linear_master_gain is not None:
+                                copy_wav_with_master_gain(asset_path, dest_path, linear_master_gain)
+                                logger.info(f'  Wrote (Utility gain bake): {dest_name}')
+                            else:
+                                shutil.copy2(asset_path, dest_path)
+                                logger.info(f'  Copied: {dest_name} (from {os.path.basename(asset_path)})')
                         except Exception as e:
-                            logger.warning(f'  Could not copy {dest_name}: {e}')
+                            logger.warning(f'  Could not export {dest_name}: {e}')
         
         preset_filepath = os.path.join(args.Output, 'preset.xml')
         
         logger.info('Saving preset XML...')
         save_xml(bb_root, preset_filepath)
-        
-        if getattr(args, 'compare', None):
-            compare_section_content(args.compare, preset_filepath)
         
         logger.info('=== Conversion complete! ===')
         logger.info(f'Output saved to: {args.Output}')
@@ -4857,11 +5178,15 @@ if __name__ == '__main__':
     parser.add_argument("-u", "--unquantised", help="Unquantised MIDI timing (precise timing, not grid-locked)", action='store_true')
     parser.add_argument("-s", "--song-mode", help="Enable song mode: map arrangement locators and clips to Blackbox song sections", action='store_true')
     parser.add_argument(
-        "-c", "--compare",
-        help="Optional: compare song section content to this preset after conversion. "
-             "With -s, may also copy expected pad_conds/seq_conds/repeats for regression; "
-             "normal song mode is derived from the .als arrangement only.",
-        type=str, default=None)
+        "--utility-master-gain",
+        dest="utility_master_gain",
+        help=(
+            "Experimental: multiply every exported Drum Rack WAV by the master's first Utility Gain "
+            "(Ableton StereoGain). Preset pad gain values are untouched. Prefer "
+            "optional packages soundfile+numpy or ffmpeg (see README)."
+        ),
+        action="store_true",
+    )
     parser.add_argument("-v", "--verbose", help="Verbose output", action='store_true')
     args = parser.parse_args()
     
