@@ -2598,9 +2598,11 @@ def detect_note_grid_pattern(events, ticks_per_beat=3840):
     straight_16_score = 0.0
     if tick_positions:
         tol_16 = _grid_alignment_tolerance(240, False)
+        # Score unique onsets only (chord stacks at one grid point should not dilute the %).
+        unique_ticks = sorted(set(tick_positions))
         straight_16_score = sum(
-            1 for t in tick_positions if _tick_aligns_to_grid(t, 240, tol_16)
-        ) / len(tick_positions)
+            1 for t in unique_ticks if _tick_aligns_to_grid(t, 240, tol_16)
+        ) / len(unique_ticks)
     if straight_16_score >= 0.70:
         step_len = 10
         grid_ticks = 240
