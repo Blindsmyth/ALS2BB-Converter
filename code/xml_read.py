@@ -2591,6 +2591,31 @@ def detect_note_grid_pattern(events, ticks_per_beat=3840):
         step_len = 10  # Default to 1/16
         grid_ticks = 240
         logger.debug(f'  Grid analysis: No grid match found, defaulting to 1/16')
+
+    # Humanised straight 16th: notes sit near a 16th grid but tolerant triplet scoring can
+    # falsely pick 1/16T / 1/8T. Prefer 16th background (step_len=10); use unquantised when
+    # alignment is good but not grid-locked (step mode off, 16th step_len in XML).
+    straight_16_score = 0.0
+    if tick_positions:
+        tol_16 = _grid_alignment_tolerance(240, False)
+        straight_16_score = sum(
+            1 for t in tick_positions if _tick_aligns_to_grid(t, 240, tol_16)
+        ) / len(tick_positions)
+    if straight_16_score >= 0.70:
+        step_len = 10
+        grid_ticks = 240
+        if straight_16_score >= 0.95:
+            is_unquantised = False
+            logger.info(
+                f'  Grid analysis: {straight_16_score * 100:.0f}% on 1/16 straight → quantised 16th'
+            )
+        else:
+            is_unquantised = True
+            logger.info(
+                f'  Grid analysis: {straight_16_score * 100:.0f}% on 1/16 straight '
+                f'(humanised) → unquantised with 16th background'
+            )
+        best_match = (240, 10, '1/16')
     
     return {
         'is_unquantised': is_unquantised,
@@ -3559,15 +3584,16 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
             # Unquantised sequences (both Keys and Pads): Use 960 ticks/beat
             # Quantisation detection is independent of Keys/Pads mode
             if is_unquantised:
-                # Unquantised: use 960 ticks/beat for strtks, constant lentks=240, lencount=0
-                # Both Keys and Pads modes use identical timing parameters (960 ticks/beat)
-                # CRITICAL: For unquantised Keys mode, chan should be 256 (not 256+target_pad)
+                # Unquantised: use 960 ticks/beat for strtks; lencount=0 uses lentks for gate length.
                 logger.info(f'    Sub-layer {chr(65+sublayer_idx)}: {seq_mode} mode, unquantised → using 960 ticks/beat, setting lencount=0')
                 for event in sublayer_events:
                     time_val = event.get('time_val', 0)
                     dur_val = event.get('dur_val', 0)
                     event['strtks'] = int(time_val * 960)  # 960 ticks/beat for unquantised (both Keys and Pads)
-                    event['lentks'] = 240  # Constant 240 ticks for unquantised sequences (matches reference)
+                    if seq_mode == 'MIDI':
+                        event['lentks'] = max(1, int(dur_val * 960))
+                    else:
+                        event['lentks'] = 240  # Constant 240 ticks for unquantised Keys/Pads (matches reference)
                     event['lencount'] = 0  # Use precise lentks timing - CRITICAL: must be 0 for unquantised
                     # For unquantised sequences, step = floor(strtks / 960) (beat position, not step_len resolution)
                     event['step'] = int(event['strtks'] // 960)
@@ -3610,13 +3636,13 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                     else:
                         event['step'] = int(time_val * steps_per_beat)
                         event['strtks'] = int(time_val * 3840)  # 3840 ticks/beat for quantised
-                    # CRITICAL: For quantised sequences, lentks should be constant 960 ticks (matches reference format)
-                    event['lentks'] = 960  # Constant 960 ticks for quantised sequences (matches reference)
-                    # Drum-rack workflow: notes are pad triggers, not sustained gates. All FIX presets
-                    # use lencount=1 (1-step gate) regardless of MIDI Duration. dur_val is preserved
-                    # in event metadata (time_val/dur_val) for any future grid analysis but is no
-                    # longer mapped onto lencount.
-                    event['lencount'] = 1
+                    if seq_mode == 'MIDI':
+                        event['lentks'] = max(1, int(dur_val * 3840))
+                        event['lencount'] = max(1, int(dur_val * steps_per_beat))
+                    else:
+                        # Drum-rack Keys/Pads: pad triggers use fixed gate (reference presets).
+                        event['lentks'] = 960
+                        event['lencount'] = 1
                 # Sort events chronologically (by strtks) — Ableton's KeyTrack iteration produces
                 # events grouped by pitch; FIX presets sort strictly by strtks so the device reads
                 # the sequence in time order.
@@ -3700,7 +3726,9 @@ def make_drum_rack_sequences(session, midi_tracks, pad_list, midi_track_info=Non
                 midioutchan_val = str(max(1, min(16, mt + 1)))
             
             if sublayer_idx == 0:
-                if seq_mode == 'Pads' and len(sublayer_events) >= 3:
+                if seq_mode == 'MIDI':
+                    dispmode_val = '2'  # External MIDI out (not Keys piano roll)
+                elif seq_mode == 'Pads' and len(sublayer_events) >= 3:
                     dispmode_val = '0'
                 else:
                     dispmode_val = '1'
